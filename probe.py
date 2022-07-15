@@ -16,7 +16,10 @@ import argparse
 import sys
 import subprocess
 import os.path
+import time
+import ctypes as ct
 
+#---------------------------args------------------------#
 examples=""
 
 parser = argparse.ArgumentParser(
@@ -30,8 +33,11 @@ parser.add_argument("-p", "--preemptoff", action="store_true",
 parser.add_argument("-i", "--irqoff", action="store_true",
                     help="Probe irq off")
 
-parser.add_argument("-d", "--duration", default=100,
+parser.add_argument("-d", "--duration", default=500,
                     help="Filter duration below this(us)")
+
+parser.add_argument("-g", "--giveup", default=1000,
+                    help="resource giveup time(ms)")
 
 args = parser.parse_args()
 
@@ -85,8 +91,10 @@ if preemptoff:
         "CONFIG_PROVE_LOCKING and CONFIG_LOCKDEP on older kernels.")
 
 
-#C program
-same_bpf_text = """
+
+
+#--------------------------CS C program-------------------------#
+fixed_cs_prog = """
 #include <uapi/linux/ptrace.h>
 #include <linux/sched.h>
 
@@ -106,7 +114,7 @@ struct start_data {
 };
 
 //output data
-struct data_t {
+struct cs_data_t {
     u64 time;
     s64 stack_id;
     u32 cpu;
@@ -118,7 +126,7 @@ struct data_t {
 BPF_STACK_TRACE(stack_traces, 16384);
 BPF_PERCPU_ARRAY(sts, struct start_data, 1);
 BPF_PERCPU_ARRAY(isidle, u64, 1);
-BPF_PERF_OUTPUT(events);
+BPF_RINGBUF_OUTPUT(cs_events,256);
 
 /*
  * In the below code we install tracepoint probes on preempt or
@@ -194,7 +202,7 @@ static void reset_state(void)
 }
 
 """
-change_bpf_text = """
+changed_cs_prog = """
 
 TRACEPOINT_PROBE(preemptirq, TYPE_disable)
 {
@@ -269,19 +277,19 @@ TRACEPOINT_PROBE(preemptirq, TYPE_enable)
     }
 
     u64 id = bpf_get_current_pid_tgid();
-    struct data_t data = {};
+    struct cs_data_t cs_data = {};
 
-    if (bpf_get_current_comm(&data.comm, sizeof(data.comm)) == 0) {
-        data.addrs[START_CALLER_OFF] = stdp->addr_offs[START_CALLER_OFF];
-        data.addrs[START_PARENT_OFF] = stdp->addr_offs[START_PARENT_OFF];
-        data.addrs[END_CALLER_OFF] = args->caller_offs;
-        data.addrs[END_PARENT_OFF] = args->parent_offs;
+    if (bpf_get_current_comm(&cs_data.comm, sizeof(cs_data.comm)) == 0) {
+        cs_data.addrs[START_CALLER_OFF] = stdp->addr_offs[START_CALLER_OFF];
+        cs_data.addrs[START_PARENT_OFF] = stdp->addr_offs[START_PARENT_OFF];
+        cs_data.addrs[END_CALLER_OFF] = args->caller_offs;
+        cs_data.addrs[END_PARENT_OFF] = args->parent_offs;
 
-        data.id = id;
-        data.stack_id = stack_traces.get_stackid(args, 0);
-        data.time = diff;
-        data.cpu = bpf_get_smp_processor_id();
-        events.perf_submit(args, &data, sizeof(data));
+        cs_data.id = id;
+        cs_data.stack_id = stack_traces.get_stackid(args, 0);
+        cs_data.time = diff;
+        cs_data.cpu = bpf_get_smp_processor_id();
+        cs_events.ringbuf_output(&cs_data, sizeof(cs_data),0);
     }
 
     reset_state();
@@ -290,19 +298,72 @@ TRACEPOINT_PROBE(preemptirq, TYPE_enable)
 """
 
 
-bpf_text=same_bpf_text
-change_bpf_text = change_bpf_text.replace('DURATION', '{}'.format(int(args.duration) * 1000))
+bpf_text=fixed_cs_prog
+changed_cs_prog = changed_cs_prog.replace('DURATION', '{}'.format(int(args.duration) * 1000))
 
 #maybe not use preemptoff
 if preemptoff:
-    bpf_text = bpf_text+change_bpf_text.replace('TYPE', 'preempt')
+    bpf_text = bpf_text+changed_cs_prog.replace('TYPE', 'preempt')
 if irqoff:
-    bpf_text = bpf_text+change_bpf_text.replace('TYPE', 'irq')
+    bpf_text = bpf_text+changed_cs_prog.replace('TYPE', 'irq')
 
     
+    
+#--------------------------spin_unlock C program-------------------------#
+lock_prog="""
+#include<linux/spinlock_types.h>
+#include<linux/spinlock.h>
+BPF_ARRAY(enabled,   u64, 1);
 
-b = BPF(text=bpf_text)
+static bool is_enabled(void)
+{
+    int key = 0;
+    u64 *ret;
 
+    ret = enabled.lookup(&key);
+    return ret && *ret == 1;
+}
+
+struct lock_data_t {
+    u64 id;
+    void *lock;
+};
+
+
+BPF_HASH(lock_hash,struct lock_data_t, u64);
+
+
+
+static int do_mutex_unlock_enter(struct spinlock_t *lock)
+{
+
+    if (!is_enabled())
+        return 0;
+        
+    u64 id = bpf_get_current_pid_tgid();
+
+    u64 cur_time = bpf_ktime_get_ns();
+    
+    struct lock_data_t cur_lock={id,(void*)lock};
+    
+    lock_hash.update(&cur_lock, &cur_time);
+    return 0;
+}
+
+int unlock_enter(struct pt_regs *ctx,struct spinlock_t *lock)
+{
+    return do_mutex_unlock_enter(lock);
+}
+"""
+
+
+
+
+bpf_text=bpf_text+lock_prog
+
+
+
+#-------------------func--------------------#
 def get_syms(kstack):
     syms = []
 
@@ -312,23 +373,39 @@ def get_syms(kstack):
 
     return syms
 
+def UpdateLock(locks):
+    for k,v in locks.items():
+        print("(pid %5d tid %5d) time: %-9.3f us lockaddr: %#x\n\n" % \
+            ((k.id >> 32), (k.id & 0xffffffff), float(v.value) / 1000,k.lock), end="")
+        
+    
 
-# process event
-def print_event(cpu, data, size):
+# process cs_event
+def PrintCS(ctx, data, size):
     try:
+        global enabled
+        global locks
+        #---update lock state
+        enabled[ct.c_int(0)] = ct.c_int(0)
+        UpdateLock(locks)
+        locks.clear()
+        enabled[ct.c_int(0)] = ct.c_int(1)
+        
+        #---output cs
         global b
-        event = b["events"].event(data)
+        event = b["cs_events"].event(data)
         stack_traces = b['stack_traces']
         #text section addr
         stext = b.ksymname('_stext')
 
-        print("===================================")
+        print("======================================================================")
         print("TASK: %s (pid %5d tid %5d) Total Time: %-9.3fus\n\n" % (event.comm, \
             (event.id >> 32), (event.id & 0xffffffff), float(event.time) / 1000), end="")
         print("Section start: {} -> {}".format(b.ksym(stext + event.addrs[0]), b.ksym(stext + event.addrs[1])))
         print("Section end:   {} -> {}".format(b.ksym(stext + event.addrs[2]), b.ksym(stext + event.addrs[3])))
 
         if event.stack_id >= 0:
+            print("STACK TRACE RESULT")
             kstack = stack_traces.walk(event.stack_id)
             syms = get_syms(kstack)
             if not syms:
@@ -339,19 +416,40 @@ def print_event(cpu, data, size):
                 print("%s" % s)
         else:
             print("NO STACK FOUND DUE TO COLLISION")
-        print("===================================")
+        print("======================================================================")
         print("")
     except Exception:
         sys.exit(0)
+        
+        
 
-b["events"].open_perf_buffer(print_event, page_cnt=256)
+#------------------------------main loop--------------------------#
+
+
+    
+b = BPF(text=bpf_text)
+
+b.attach_kprobe(event="_raw_spin_unlock", fn_name="unlock_enter")
+
+b["cs_events"].open_ring_buffer(PrintCS)
+enabled = b["enabled"]
+locks=b["lock_hash"]
 
 print("Finding critical section with {} disabled for > {}us".format( \
     ('preempt and IRQ' if (preemptoff and irqoff) else ('preempt' if preemptoff else 'IRQ' )), \
     args.duration))
 
+enabled[ct.c_int(0)] = ct.c_int(1)
 while 1:
     try:
-        b.perf_buffer_poll()
+
+        time.sleep(1)
+
+
+        #get a cs
+        b.ring_buffer_poll()
+
+
+
     except KeyboardInterrupt:
         exit()
