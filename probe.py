@@ -93,10 +93,94 @@ if preemptoff:
 
 
 
+#--------------------------spin_unlock C program-------------------------#
+lock_prog="""
+#include<linux/spinlock_types.h>
+#include<linux/spinlock.h>
+BPF_ARRAY(enabled,   u64, 1);
+
+static bool is_enabled(void)
+{
+    int key = 0;
+    u64 *ret;
+
+    ret = enabled.lookup(&key);
+    return ret && *ret == 1;
+}
+
+struct lock_data_t {
+    u64 id;
+    void *lock;
+};
+
+
+BPF_HASH(lock_hash,struct lock_data_t, u64,102400);
+
+
+
+int unlock_enter(struct pt_regs *ctx,struct spinlock_t *lock)
+{
+    
+    if (!is_enabled())
+        return 0;
+        
+    u64 id = bpf_get_current_pid_tgid();
+
+    u64 cur_time = bpf_ktime_get_ns();
+    
+    struct lock_data_t cur_lock={id,(void*)lock};
+    
+    lock_hash.update(&cur_lock, &cur_time);
+    return 0;
+}
+"""
+
+
+
+
+bpf_text=lock_prog
+
+
+#--------------------------vfs C program-------------------------#
+file_prog="""
+#include<linux/fs.h>
+
+
+struct file_data_t {
+    u64 id;
+    u64 inode;
+};
+
+
+BPF_HASH(file_hash,struct file_data_t, u64,102400);
+
+
+int vfs_read_write(struct pt_regs *ctx,struct file *file)
+{
+    if (!is_enabled())
+        return 0;
+        
+    u64 id = bpf_get_current_pid_tgid();
+
+    u64 cur_time = bpf_ktime_get_ns();
+    
+    struct file_data_t cur_file={id,file->f_inode->i_ino};
+    
+    file_hash.update(&cur_file, &cur_time);
+    return 0;
+}
+"""
+
+
+bpf_text=bpf_text+file_prog
 #--------------------------CS C program-------------------------#
 fixed_cs_prog = """
-#include <uapi/linux/ptrace.h>
-#include <linux/sched.h>
+
+#include<uapi/linux/ptrace.h>
+#include<linux/sched.h>
+#include<linux/fdtable.h>
+
+
 
 enum addr_offs {
     START_CALLER_OFF,
@@ -121,13 +205,20 @@ struct cs_data_t {
     u64 id;
     u32 addrs[4];   /* indexed by addr_offs */
     char comm[TASK_COMM_LEN];
+
 };
 
+struct cs_file_data_t {
+    u64 id;
+    u64 inode;
+};
 BPF_STACK_TRACE(stack_traces, 16384);
 BPF_PERCPU_ARRAY(sts, struct start_data, 1);
 BPF_PERCPU_ARRAY(isidle, u64, 1);
 BPF_RINGBUF_OUTPUT(cs_events,256);
 
+//BPF_HASH(cs_file_hash,struct cs_file_data_t, u64,102400);
+//BPF_ARRAY(cs_file_array,struct cs_file_data_t,102400);
 /*
  * In the below code we install tracepoint probes on preempt or
  * IRQ disable/enable critical sections and idle events, the cases
@@ -230,6 +321,7 @@ TRACEPOINT_PROBE(preemptirq, TYPE_disable)
     return 0;
 }
 
+
 TRACEPOINT_PROBE(preemptirq, TYPE_enable)
 {
     int idx = 0;
@@ -278,7 +370,55 @@ TRACEPOINT_PROBE(preemptirq, TYPE_enable)
 
     u64 id = bpf_get_current_pid_tgid();
     struct cs_data_t cs_data = {};
+    
+    /*
+    //get file from task
+    struct task_struct *cur=(struct task_struct *)bpf_get_current_task();
+    struct files_struct *fs;
+    bpf_probe_read_kernel(&fs,sizeof(fs),&(cur->files));
+    struct fdtable *fdt;
+    bpf_probe_read_kernel(&fdt,sizeof(fdt),&(fs->fdt));
+    u32 limit;
+    bpf_probe_read_kernel(&limit,sizeof(limit),&(fdt->max_fds));
+    u64 *mask;
+    bpf_probe_read_kernel(&mask,sizeof(mask),&(fdt->open_fds));
+    struct file** fds;
+    bpf_probe_read_kernel(&fds,sizeof(fds),&(fdt->fd));
+    
+    struct cs_file_data_t cur_cs_file={id,0};
+    u32 i=0;
 
+    while(i<1)
+    {
+        if(i>=limit) break;
+        u64 bias=i/64;
+        u64 digit=i%64;
+        if(((*(mask+bias))>>digit)&1)
+        {
+            struct file* f;
+            f=fds[i];
+            //bpf_probe_read_kernel(&f,sizeof(f),&(fds[i]));
+            struct inode *inod;
+            inod=f->f_inode;
+            //bpf_probe_read_kernel(&inod,sizeof(inod),f->f_inode);
+            u64 ino;
+            ino=inod->i_ino;
+            //bpf_probe_read_kernel(&ino,sizeof(ino),&inod->i_ino);
+            cur_cs_file.inode=ino;
+            //cur_cs_file.inode=BPF_CORE_READ(f,d_inode,i_ino);
+            //bpf_probe_read(&cur_cs_file.inode,sizeof(ino),&ino);
+            //cs_file_hash.update(&cur_cs_file, &end_ts); 
+            //cs_file_array.update(&cur_cs_file); 
+
+        } 
+        //cs_file_hash.update(&cur_cs_file, &end_ts); 
+        i++;      
+    }
+    */
+
+
+    
+    //get info
     if (bpf_get_current_comm(&cs_data.comm, sizeof(cs_data.comm)) == 0) {
         cs_data.addrs[START_CALLER_OFF] = stdp->addr_offs[START_CALLER_OFF];
         cs_data.addrs[START_PARENT_OFF] = stdp->addr_offs[START_PARENT_OFF];
@@ -292,13 +432,14 @@ TRACEPOINT_PROBE(preemptirq, TYPE_enable)
         cs_events.ringbuf_output(&cs_data, sizeof(cs_data),0);
     }
 
+
     reset_state();
     return 0;
 }
 """
 
 
-bpf_text=fixed_cs_prog
+bpf_text=bpf_text+fixed_cs_prog
 changed_cs_prog = changed_cs_prog.replace('DURATION', '{}'.format(int(args.duration) * 1000))
 
 #maybe not use preemptoff
@@ -309,60 +450,6 @@ if irqoff:
 
     
     
-#--------------------------spin_unlock C program-------------------------#
-lock_prog="""
-#include<linux/spinlock_types.h>
-#include<linux/spinlock.h>
-BPF_ARRAY(enabled,   u64, 1);
-
-static bool is_enabled(void)
-{
-    int key = 0;
-    u64 *ret;
-
-    ret = enabled.lookup(&key);
-    return ret && *ret == 1;
-}
-
-struct lock_data_t {
-    u64 id;
-    void *lock;
-};
-
-
-BPF_HASH(lock_hash,struct lock_data_t, u64);
-
-
-
-static int do_mutex_unlock_enter(struct spinlock_t *lock)
-{
-
-    if (!is_enabled())
-        return 0;
-        
-    u64 id = bpf_get_current_pid_tgid();
-
-    u64 cur_time = bpf_ktime_get_ns();
-    
-    struct lock_data_t cur_lock={id,(void*)lock};
-    
-    lock_hash.update(&cur_lock, &cur_time);
-    return 0;
-}
-
-int unlock_enter(struct pt_regs *ctx,struct spinlock_t *lock)
-{
-    return do_mutex_unlock_enter(lock);
-}
-"""
-
-
-
-
-bpf_text=bpf_text+lock_prog
-
-
-
 #-------------------func--------------------#
 def get_syms(kstack):
     syms = []
@@ -377,20 +464,36 @@ def UpdateLock(locks):
     for k,v in locks.items():
         print("(pid %5d tid %5d) time: %-9.3f us lockaddr: %#x\n\n" % \
             ((k.id >> 32), (k.id & 0xffffffff), float(v.value) / 1000,k.lock), end="")
+    print("----------------------------------------------------------------------")
         
-    
+def UpdateFile(files):
+    for k,v in files.items():
+        print("(pid %5d tid %5d) time: %-9.3f us fileino: %d\n\n" % \
+            ((k.id >> 32), (k.id & 0xffffffff), float(v.value) / 1000,k.inode), end="")
+    print("----------------------------------------------------------------------")
+        
 
 # process cs_event
 def PrintCS(ctx, data, size):
     try:
         global enabled
         global locks
+        global files
+        global cs_files
         #---update lock state
         enabled[ct.c_int(0)] = ct.c_int(0)
         UpdateLock(locks)
         locks.clear()
+        UpdateFile(files)
+        files.clear()
+        '''
+        print("\n\n\n\n")
+        for k,v in cs_files.items():
+            print(k.id)
+            print(k.inode)
+        print("\n\n\n\n")        '''
         enabled[ct.c_int(0)] = ct.c_int(1)
-        
+
         #---output cs
         global b
         event = b["cs_events"].event(data)
@@ -398,12 +501,11 @@ def PrintCS(ctx, data, size):
         #text section addr
         stext = b.ksymname('_stext')
 
-        print("======================================================================")
+        #print("======================================================================")
         print("TASK: %s (pid %5d tid %5d) Total Time: %-9.3fus\n\n" % (event.comm, \
             (event.id >> 32), (event.id & 0xffffffff), float(event.time) / 1000), end="")
         print("Section start: {} -> {}".format(b.ksym(stext + event.addrs[0]), b.ksym(stext + event.addrs[1])))
         print("Section end:   {} -> {}".format(b.ksym(stext + event.addrs[2]), b.ksym(stext + event.addrs[3])))
-
         if event.stack_id >= 0:
             print("STACK TRACE RESULT")
             kstack = stack_traces.walk(event.stack_id)
@@ -431,9 +533,17 @@ b = BPF(text=bpf_text)
 
 b.attach_kprobe(event="_raw_spin_unlock", fn_name="unlock_enter")
 
+b.attach_kprobe(event="vfs_read", fn_name="vfs_read_write")
+b.attach_kprobe(event="vfs_write", fn_name="vfs_read_write")
+#after verify vfs_read/write call __vfs_read/write but cannot attach
+#b.attach_kprobe(event="__vfs_read", fn_name="vfs_read_write")
+#b.attach_kprobe(event="__vfs_write", fn_name="vfs_read_write")
+
 b["cs_events"].open_ring_buffer(PrintCS)
 enabled = b["enabled"]
 locks=b["lock_hash"]
+files=b["file_hash"]
+#cs_files=b["cs_file_hash"]
 
 print("Finding critical section with {} disabled for > {}us".format( \
     ('preempt and IRQ' if (preemptoff and irqoff) else ('preempt' if preemptoff else 'IRQ' )), \
@@ -443,7 +553,7 @@ enabled[ct.c_int(0)] = ct.c_int(1)
 while 1:
     try:
 
-        time.sleep(1)
+        #time.sleep(1)
 
 
         #get a cs
