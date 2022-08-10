@@ -91,95 +91,31 @@ if preemptoff:
         "CONFIG_PROVE_LOCKING and CONFIG_LOCKDEP on older kernels.")
 
 
-
-
-#--------------------------spin_unlock C program-------------------------#
-lock_prog="""
+#--------------------------output C program-------------------------#
+bpf_text="""
 #include<linux/spinlock_types.h>
 #include<linux/spinlock.h>
+#include<linux/fs.h>
+#include<uapi/linux/ptrace.h>
+#include<linux/sched.h>
+#include<linux/fdtable.h>
+
+
 BPF_ARRAY(enabled,   u64, 1);
 
-static bool is_enabled(void)
-{
-    int key = 0;
-    u64 *ret;
-
-    ret = enabled.lookup(&key);
-    return ret && *ret == 1;
-}
 
 struct lock_data_t {
     u64 id;
     void *lock;
 };
-
-
 BPF_HASH(lock_hash,struct lock_data_t, u64,102400);
-
-
-
-int unlock_enter(struct pt_regs *ctx,struct spinlock_t *lock)
-{
-    
-    if (!is_enabled())
-        return 0;
-        
-    u64 id = bpf_get_current_pid_tgid();
-
-    u64 cur_time = bpf_ktime_get_ns();
-    
-    struct lock_data_t cur_lock={id,(void*)lock};
-    
-    lock_hash.update(&cur_lock, &cur_time);
-    return 0;
-}
-"""
-
-
-
-
-bpf_text=lock_prog
-
-
-#--------------------------vfs C program-------------------------#
-file_prog="""
-#include<linux/fs.h>
 
 
 struct file_data_t {
     u64 id;
     u64 inode;
 };
-
-
 BPF_HASH(file_hash,struct file_data_t, u64,102400);
-
-
-int vfs_read_write(struct pt_regs *ctx,struct file *file)
-{
-    if (!is_enabled())
-        return 0;
-        
-    u64 id = bpf_get_current_pid_tgid();
-
-    u64 cur_time = bpf_ktime_get_ns();
-    
-    struct file_data_t cur_file={id,file->f_inode->i_ino};
-    
-    file_hash.update(&cur_file, &cur_time);
-    return 0;
-}
-"""
-
-
-bpf_text=bpf_text+file_prog
-#--------------------------CS C program-------------------------#
-fixed_cs_prog = """
-
-#include<uapi/linux/ptrace.h>
-#include<linux/sched.h>
-#include<linux/fdtable.h>
-
 
 
 enum addr_offs {
@@ -199,6 +135,7 @@ struct start_data {
 
 //output data
 struct cs_data_t {
+    u64 ts;
     u64 time;
     s64 stack_id;
     u32 cpu;
@@ -208,17 +145,23 @@ struct cs_data_t {
 
 };
 
-struct cs_file_data_t {
-    u64 id;
-    u64 inode;
-};
 BPF_STACK_TRACE(stack_traces, 16384);
 BPF_PERCPU_ARRAY(sts, struct start_data, 1);
 BPF_PERCPU_ARRAY(isidle, u64, 1);
 BPF_RINGBUF_OUTPUT(cs_events,256);
 
+/*
+struct cs_file_data_t {
+    u64 id;
+    u64 inode;
+};*/
 //BPF_HASH(cs_file_hash,struct cs_file_data_t, u64,102400);
 //BPF_ARRAY(cs_file_array,struct cs_file_data_t,102400);
+
+
+"""
+#--------------------------CS C program-------------------------#
+fixed_cs_prog = """
 /*
  * In the below code we install tracepoint probes on preempt or
  * IRQ disable/enable critical sections and idle events, the cases
@@ -371,7 +314,7 @@ TRACEPOINT_PROBE(preemptirq, TYPE_enable)
     u64 id = bpf_get_current_pid_tgid();
     struct cs_data_t cs_data = {};
     
-    /*
+    /* There is trying to get file info from enable func
     //get file from task
     struct task_struct *cur=(struct task_struct *)bpf_get_current_task();
     struct files_struct *fs;
@@ -424,7 +367,8 @@ TRACEPOINT_PROBE(preemptirq, TYPE_enable)
         cs_data.addrs[START_PARENT_OFF] = stdp->addr_offs[START_PARENT_OFF];
         cs_data.addrs[END_CALLER_OFF] = args->caller_offs;
         cs_data.addrs[END_PARENT_OFF] = args->parent_offs;
-
+        
+        cs_data.ts= start_ts;
         cs_data.id = id;
         cs_data.stack_id = stack_traces.get_stackid(args, 0);
         cs_data.time = diff;
@@ -448,6 +392,101 @@ if preemptoff:
 if irqoff:
     bpf_text = bpf_text+changed_cs_prog.replace('TYPE', 'irq')
 
+#--------------------------spin_unlock C program-------------------------#
+lock_prog="""
+
+
+static bool is_enabled(void)
+{
+    int key = 0;
+    u64 *ret;
+
+    ret = enabled.lookup(&key);
+    return ret && *ret == 1;
+}
+
+
+int unlock_enter(struct pt_regs *ctx,struct spinlock_t *lock)
+{
+    
+    if (!is_enabled())
+        return 0;
+    /*
+    int idx = 0;
+    struct start_data *stdp;
+    if (in_idle()) {
+        return 0;
+    }
+    stdp = sts.lookup(&idx);
+    if (!stdp) {
+        return 0;
+    }
+    if (!stdp->active) {
+        return 0;
+    }
+    if (stdp->idle_skip) {
+        return 0;
+    }
+    */
+    
+    u64 id = bpf_get_current_pid_tgid();
+
+    u64 cur_time = bpf_ktime_get_ns();
+    
+    struct lock_data_t cur_lock={id,(void*)lock};
+    
+    lock_hash.update(&cur_lock, &cur_time);
+    return 0;
+}
+"""
+
+
+
+
+bpf_text=bpf_text+lock_prog
+
+
+#--------------------------vfs C program-------------------------#
+file_prog="""
+
+
+int vfs_read_write(struct pt_regs *ctx,struct file *file)
+{
+
+    if (!is_enabled())
+        return 0;
+    /*
+    int idx = 0;
+    struct start_data *stdp;
+    if (in_idle()) {
+        return 0;
+    }
+    stdp = sts.lookup(&idx);
+    if (!stdp) {
+        return 0;
+    }
+    if (!stdp->active) {
+        return 0;
+    }
+    if (stdp->idle_skip) {
+        return 0;
+    }
+    */
+    
+    u64 id = bpf_get_current_pid_tgid();
+
+    u64 cur_time = bpf_ktime_get_ns();
+    
+    struct file_data_t cur_file={id,file->f_inode->i_ino};
+    
+    file_hash.update(&cur_file, &cur_time);
+    return 0;
+}
+"""
+
+
+bpf_text=bpf_text+file_prog
+
     
     
 #-------------------func--------------------#
@@ -461,15 +500,19 @@ def get_syms(kstack):
     return syms
 
 def UpdateLock(locks):
+    global ts
     for k,v in locks.items():
-        print("(pid %5d tid %5d) time: %-9.3f us lockaddr: %#x\n\n" % \
-            ((k.id >> 32), (k.id & 0xffffffff), float(v.value) / 1000,k.lock), end="")
+        if v.value>=ts:#only print in CS resource
+            print("(pid %5d tid %5d) time: %-9.3f us lockaddr: %#x\n\n" % \
+                ((k.id >> 32), (k.id & 0xffffffff), float(v.value) / 1000,k.lock), end="")
     print("----------------------------------------------------------------------")
         
 def UpdateFile(files):
+    global ts
     for k,v in files.items():
-        print("(pid %5d tid %5d) time: %-9.3f us fileino: %d\n\n" % \
-            ((k.id >> 32), (k.id & 0xffffffff), float(v.value) / 1000,k.inode), end="")
+        if v.value>=ts:#only print in CS resource
+            print("(pid %5d tid %5d) time: %-9.3f us fileino: %d\n\n" % \
+                ((k.id >> 32), (k.id & 0xffffffff), float(v.value) / 1000,k.inode), end="")
     print("----------------------------------------------------------------------")
         
 
@@ -480,6 +523,10 @@ def PrintCS(ctx, data, size):
         global locks
         global files
         global cs_files
+        global b
+        event = b["cs_events"].event(data)
+        global ts
+        ts=event.ts
         #---update lock state
         enabled[ct.c_int(0)] = ct.c_int(0)
         UpdateLock(locks)
@@ -495,8 +542,7 @@ def PrintCS(ctx, data, size):
         enabled[ct.c_int(0)] = ct.c_int(1)
 
         #---output cs
-        global b
-        event = b["cs_events"].event(data)
+
         stack_traces = b['stack_traces']
         #text section addr
         stext = b.ksymname('_stext')
@@ -544,6 +590,7 @@ enabled = b["enabled"]
 locks=b["lock_hash"]
 files=b["file_hash"]
 #cs_files=b["cs_file_hash"]
+ts=0#time start
 
 print("Finding critical section with {} disabled for > {}us".format( \
     ('preempt and IRQ' if (preemptoff and irqoff) else ('preempt' if preemptoff else 'IRQ' )), \
