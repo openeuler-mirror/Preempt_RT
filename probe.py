@@ -99,7 +99,7 @@ bpf_text="""
 #include<uapi/linux/ptrace.h>
 #include<linux/sched.h>
 #include<linux/fdtable.h>
-
+#include<linux/net.h>
 
 BPF_ARRAY(enabled,   u64, 1);
 
@@ -117,6 +117,11 @@ struct file_data_t {
 };
 BPF_HASH(file_hash,struct file_data_t, u64,102400);
 
+struct sock_data_t {
+    u64 id;
+    void *sock;
+};
+BPF_HASH(sock_hash,struct sock_data_t, u64,102400);
 
 enum addr_offs {
     START_CALLER_OFF,
@@ -489,6 +494,32 @@ bpf_text=bpf_text+file_prog
 
     
     
+#--------------------------sock C program-------------------------#
+sock_prog="""
+
+
+int sock_recv_sends_msg_enter(struct pt_regs *ctx,struct socket *sock,struct msghdr *msg)
+{
+
+    if (!is_enabled())
+        return 0;
+
+    
+    u64 id = bpf_get_current_pid_tgid();
+
+    u64 cur_time = bpf_ktime_get_ns();
+    
+    struct sock_data_t cur_sock={id,sock};
+    
+    sock_hash.update(&cur_sock, &cur_time);
+    return 0;
+}
+"""
+
+
+bpf_text=bpf_text+sock_prog
+
+    
 #-------------------func--------------------#
 def get_syms(kstack):
     syms = []
@@ -502,7 +533,7 @@ def get_syms(kstack):
 def UpdateLock(locks):
     global ts
     for k,v in locks.items():
-        if v.value>=ts:#only print in CS resource
+        #if v.value>=ts:#only print in CS resource
             print("(pid %5d tid %5d) time: %-9.3f us lockaddr: %#x\n\n" % \
                 ((k.id >> 32), (k.id & 0xffffffff), float(v.value) / 1000,k.lock), end="")
     print("----------------------------------------------------------------------")
@@ -510,12 +541,18 @@ def UpdateLock(locks):
 def UpdateFile(files):
     global ts
     for k,v in files.items():
-        if v.value>=ts:#only print in CS resource
+        #if v.value>=ts:#only print in CS resource
             print("(pid %5d tid %5d) time: %-9.3f us fileino: %d\n\n" % \
                 ((k.id >> 32), (k.id & 0xffffffff), float(v.value) / 1000,k.inode), end="")
     print("----------------------------------------------------------------------")
         
-
+def UpdateSock(socks):
+    global ts
+    for k,v in socks.items():
+        #if v.value>=ts:#only print in CS resource
+            print("(pid %5d tid %5d) time: %-9.3f us sockaddr: %#x\n\n" % \
+                ((k.id >> 32), (k.id & 0xffffffff), float(v.value) / 1000,k.sock), end="")
+    print("----------------------------------------------------------------------")
 # process cs_event
 def PrintCS(ctx, data, size):
     try:
@@ -533,6 +570,8 @@ def PrintCS(ctx, data, size):
         locks.clear()
         UpdateFile(files)
         files.clear()
+        UpdateSock(socks)
+        socks.clear()
         '''
         print("\n\n\n\n")
         for k,v in cs_files.items():
@@ -585,10 +624,13 @@ b.attach_kprobe(event="vfs_write", fn_name="vfs_read_write")
 #b.attach_kprobe(event="__vfs_read", fn_name="vfs_read_write")
 #b.attach_kprobe(event="__vfs_write", fn_name="vfs_read_write")
 
+b.attach_kprobe(event="sock_sendmsg", fn_name="sock_recv_sends_msg_enter")
+b.attach_kprobe(event="sock_recvmsg", fn_name="sock_recv_sends_msg_enter")
 b["cs_events"].open_ring_buffer(PrintCS)
 enabled = b["enabled"]
 locks=b["lock_hash"]
 files=b["file_hash"]
+socks=b["sock_hash"]
 #cs_files=b["cs_file_hash"]
 ts=0#time start
 
