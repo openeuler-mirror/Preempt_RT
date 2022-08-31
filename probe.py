@@ -531,30 +531,43 @@ def get_syms(kstack):
     return syms
 
 def UpdateLock(locks):
-    global ts
+    #global ts
+    global hash_map
     for k,v in locks.items():
+        if not (k.id in hash_map):
+            hash_map[k.id]=[{},{},{}]
+        hash_map[k.id][0][k.lock]=float(v.value) / 1000
+            
         #if v.value>=ts:#only print in CS resource
-            print("(pid %5d tid %5d) time: %-9.3f us lockaddr: %#x\n\n" % \
-                ((k.id >> 32), (k.id & 0xffffffff), float(v.value) / 1000,k.lock), end="")
+        print("(pid %5d tid %5d) time: %-9.3f us lockaddr: %#x\n\n" % \
+            ((k.id >> 32), (k.id & 0xffffffff), float(v.value) / 1000,k.lock), end="")
     print("----------------------------------------------------------------------")
         
 def UpdateFile(files):
-    global ts
+    #global ts
+    global hash_map
     for k,v in files.items():
+        if not (k.id in hash_map):
+            hash_map[k.id]=[{},{},{}]
+        hash_map[k.id][1][k.inode]=float(v.value) / 1000
         #if v.value>=ts:#only print in CS resource
-            print("(pid %5d tid %5d) time: %-9.3f us fileino: %d\n\n" % \
-                ((k.id >> 32), (k.id & 0xffffffff), float(v.value) / 1000,k.inode), end="")
+        print("(pid %5d tid %5d) time: %-9.3f us fileino: %d\n\n" % \
+            ((k.id >> 32), (k.id & 0xffffffff), float(v.value) / 1000,k.inode), end="")
     print("----------------------------------------------------------------------")
         
 def UpdateSock(socks):
-    global ts
+    #global ts
+    global hash_map
     for k,v in socks.items():
+        if not (k.id in hash_map):
+            hash_map[k.id]=[{},{},{}]
+        hash_map[k.id][2][k.sock]=float(v.value) / 1000
         #if v.value>=ts:#only print in CS resource
-            print("(pid %5d tid %5d) time: %-9.3f us sockaddr: %#x\n\n" % \
-                ((k.id >> 32), (k.id & 0xffffffff), float(v.value) / 1000,k.sock), end="")
+        print("(pid %5d tid %5d) time: %-9.3f us sockaddr: %#x\n\n" % \
+            ((k.id >> 32), (k.id & 0xffffffff), float(v.value) / 1000,k.sock), end="")
     print("----------------------------------------------------------------------")
 # process cs_event
-def PrintCS(ctx, data, size):
+def RecordCS(ctx, data, size):
     try:
         global enabled
         global locks
@@ -562,8 +575,8 @@ def PrintCS(ctx, data, size):
         global cs_files
         global b
         event = b["cs_events"].event(data)
-        global ts
-        ts=event.ts
+        #global ts
+        #ts=event.ts
         #---update lock state
         enabled[ct.c_int(0)] = ct.c_int(0)
         UpdateLock(locks)
@@ -572,6 +585,13 @@ def PrintCS(ctx, data, size):
         files.clear()
         UpdateSock(socks)
         socks.clear()
+        print(len(hash_map))
+        all_len=0
+        for k,v in hash_map.items():
+            all_len+=len(v[0])
+            all_len+=len(v[1])
+            all_len+=len(v[2])
+        print(all_len)
         '''
         print("\n\n\n\n")
         for k,v in cs_files.items():
@@ -612,8 +632,8 @@ def PrintCS(ctx, data, size):
 
 #------------------------------main loop--------------------------#
 
+hash_map={}
 
-    
 b = BPF(text=bpf_text)
 
 b.attach_kprobe(event="_raw_spin_unlock", fn_name="unlock_enter")
@@ -626,7 +646,7 @@ b.attach_kprobe(event="vfs_write", fn_name="vfs_read_write")
 
 b.attach_kprobe(event="sock_sendmsg", fn_name="sock_recv_sends_msg_enter")
 b.attach_kprobe(event="sock_recvmsg", fn_name="sock_recv_sends_msg_enter")
-b["cs_events"].open_ring_buffer(PrintCS)
+b["cs_events"].open_ring_buffer(RecordCS)
 enabled = b["enabled"]
 locks=b["lock_hash"]
 files=b["file_hash"]
