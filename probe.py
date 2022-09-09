@@ -18,6 +18,7 @@ import subprocess
 import os.path
 import time
 import ctypes as ct
+import psutil
 
 #---------------------------args------------------------#
 examples=""
@@ -102,7 +103,7 @@ bpf_text="""
 #include<linux/net.h>
 
 BPF_ARRAY(enabled,   u64, 1);
-
+BPF_ARRAY(tot_time,   u64, 1);
 
 struct lock_data_t {
     u64 id;
@@ -184,8 +185,22 @@ fixed_cs_prog = """
  * such cases, we avoid recording those critical sections since they
  * are not worth while to record and just add noise.
  */
+ 
+static void AddToTalTime(u64 st_time)
+{
+    int key = 0;
+    u64 *ret;
+    ret = tot_time.lookup(&key);//old time
+    if(ret)
+    {
+        u64 new_time=*ret+bpf_ktime_get_ns()-st_time;
+        tot_time.update(&key,&new_time);
+    }
+
+}
 TRACEPOINT_PROBE(power, cpu_idle)
 {
+    u64 st_time=bpf_ktime_get_ns();
     int idx = 0;
     u64 val;
     struct start_data *stdp, std;
@@ -216,6 +231,7 @@ TRACEPOINT_PROBE(power, cpu_idle)
         val = 0;
         isidle.update(&idx, &val);
     }
+    AddToTalTime(st_time);
     return 0;
 }
 
@@ -245,6 +261,7 @@ changed_cs_prog = """
 
 TRACEPOINT_PROBE(preemptirq, TYPE_disable)
 {
+    u64 st_time=bpf_ktime_get_ns();
     int idx = 0;
     struct start_data s;
 
@@ -253,6 +270,7 @@ TRACEPOINT_PROBE(preemptirq, TYPE_disable)
     if (in_idle()) {
         //in idle, skip this trace, reset sts state
         reset_state();
+        AddToTalTime(st_time);
         return 0;
     }
 
@@ -266,12 +284,14 @@ TRACEPOINT_PROBE(preemptirq, TYPE_disable)
     s.active = 1;
 
     sts.update(&idx, &s);
+    AddToTalTime(st_time);
     return 0;
 }
 
 
 TRACEPOINT_PROBE(preemptirq, TYPE_enable)
 {
+    u64 st_time=bpf_ktime_get_ns();
     int idx = 0;
     u64 start_ts, end_ts, diff;
     struct start_data *stdp;
@@ -280,24 +300,28 @@ TRACEPOINT_PROBE(preemptirq, TYPE_enable)
     // Handle the case Ienter, CSenter, CSexit, Iexit
     if (in_idle()) {
         reset_state();
+        AddToTalTime(st_time);
         return 0;
     }
 
     stdp = sts.lookup(&idx);
     if (!stdp) {
         reset_state();
+        AddToTalTime(st_time);
         return 0;
     }
 
     // Handle the case Ienter, Csenter, Iexit, Csexit
     if (!stdp->active) {
         reset_state();
+        AddToTalTime(st_time);
         return 0;
     }
 
     // Handle the case CSenter, Ienter, Iexit, CSexit
     if (stdp->idle_skip) {
         reset_state();
+        AddToTalTime(st_time);
         return 0;
     }
 
@@ -306,6 +330,7 @@ TRACEPOINT_PROBE(preemptirq, TYPE_enable)
 
     if (start_ts > end_ts) {
         reset_state();
+        AddToTalTime(st_time);
         return 0;
     }
 
@@ -313,6 +338,7 @@ TRACEPOINT_PROBE(preemptirq, TYPE_enable)
 
     if (diff < DURATION) {
         reset_state();
+        AddToTalTime(st_time);
         return 0;
     }
 
@@ -383,6 +409,7 @@ TRACEPOINT_PROBE(preemptirq, TYPE_enable)
 
 
     reset_state();
+    AddToTalTime(st_time);
     return 0;
 }
 """
@@ -413,9 +440,10 @@ static bool is_enabled(void)
 
 int unlock_enter(struct pt_regs *ctx,struct spinlock_t *lock)
 {
-    
+
     if (!is_enabled())
         return 0;
+    u64 st_time=bpf_ktime_get_ns();
     /*
     int idx = 0;
     struct start_data *stdp;
@@ -441,6 +469,7 @@ int unlock_enter(struct pt_regs *ctx,struct spinlock_t *lock)
     struct lock_data_t cur_lock={id,(void*)lock};
     
     lock_hash.update(&cur_lock, &cur_time);
+    AddToTalTime(st_time);
     return 0;
 }
 """
@@ -460,6 +489,7 @@ int vfs_read_write(struct pt_regs *ctx,struct file *file)
 
     if (!is_enabled())
         return 0;
+    u64 st_time=bpf_ktime_get_ns();
     /*
     int idx = 0;
     struct start_data *stdp;
@@ -485,6 +515,7 @@ int vfs_read_write(struct pt_regs *ctx,struct file *file)
     struct file_data_t cur_file={id,file->f_inode->i_ino};
     
     file_hash.update(&cur_file, &cur_time);
+    AddToTalTime(st_time);
     return 0;
 }
 """
@@ -503,7 +534,7 @@ int sock_recv_sends_msg_enter(struct pt_regs *ctx,struct socket *sock,struct msg
 
     if (!is_enabled())
         return 0;
-
+    u64 st_time=bpf_ktime_get_ns();
     
     u64 id = bpf_get_current_pid_tgid();
 
@@ -512,6 +543,7 @@ int sock_recv_sends_msg_enter(struct pt_regs *ctx,struct socket *sock,struct msg
     struct sock_data_t cur_sock={id,sock};
     
     sock_hash.update(&cur_sock, &cur_time);
+    AddToTalTime(st_time);
     return 0;
 }
 """
@@ -536,11 +568,11 @@ def UpdateLock(locks):
     for k,v in locks.items():
         if not (k.id in hash_map):
             hash_map[k.id]=[{},{},{}]
-        hash_map[k.id][0][k.lock]=float(v.value) / 1000
+        hash_map[k.id][0][k.lock]=float(v.value)
             
         #if v.value>=ts:#only print in CS resource
-        print("(pid %5d tid %5d) time: %-9.3f us lockaddr: %#x\n\n" % \
-            ((k.id >> 32), (k.id & 0xffffffff), float(v.value) / 1000,k.lock), end="")
+        print("(pid %5d tid %5d) time: %s lockaddr: %#x\n\n" % \
+            ((k.id >> 32), (k.id & 0xffffffff), (time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(boot_t+float(v.value)/1000000000))) ,k.lock), end="")
     print("----------------------------------------------------------------------")
         
 def UpdateFile(files):
@@ -549,10 +581,10 @@ def UpdateFile(files):
     for k,v in files.items():
         if not (k.id in hash_map):
             hash_map[k.id]=[{},{},{}]
-        hash_map[k.id][1][k.inode]=float(v.value) / 1000
+        hash_map[k.id][1][k.inode]=float(v.value)
         #if v.value>=ts:#only print in CS resource
-        print("(pid %5d tid %5d) time: %-9.3f us fileino: %d\n\n" % \
-            ((k.id >> 32), (k.id & 0xffffffff), float(v.value) / 1000,k.inode), end="")
+        print("(pid %5d tid %5d) time: %s fileino: %d\n\n" % \
+            ((k.id >> 32), (k.id & 0xffffffff), (time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(boot_t+float(v.value)/1000000000))),k.inode), end="")
     print("----------------------------------------------------------------------")
         
 def UpdateSock(socks):
@@ -561,23 +593,68 @@ def UpdateSock(socks):
     for k,v in socks.items():
         if not (k.id in hash_map):
             hash_map[k.id]=[{},{},{}]
-        hash_map[k.id][2][k.sock]=float(v.value) / 1000
+        hash_map[k.id][2][k.sock]=float(v.value)
         #if v.value>=ts:#only print in CS resource
-        print("(pid %5d tid %5d) time: %-9.3f us sockaddr: %#x\n\n" % \
-            ((k.id >> 32), (k.id & 0xffffffff), float(v.value) / 1000,k.sock), end="")
+        print("(pid %5d tid %5d) time: %s sockaddr: %#x\n\n" % \
+            ((k.id >> 32), (k.id & 0xffffffff), (time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(boot_t+float(v.value)/1000000000))),k.sock), end="")
     print("----------------------------------------------------------------------")
 # process cs_event
+def Find(pos):
+    global p
+    if p[pos]!=pos:
+        p[pos]=Find(p[pos])
+    return p[pos]
+    
+def Merge(a,b):
+    global p
+    global sz
+    pa=Find(a)
+    pb=Find(b)
+    if pa!=pb:
+        p[pa]=pb
+        sz[pb]+=sz[pa]
+
+def CanMerge(i,j):
+    global CS_id_to_pos 
+    global tid
+    global hash_map
+    id1=tid[i]
+    id2=tid[j]
+    for obj1 in hash_map[id1][0]:
+        for obj2 in hash_map[id2][0]:
+            if obj1==obj2:
+                return True
+    for obj1 in hash_map[id1][1]:
+        for obj2 in hash_map[id2][1]:
+            if obj1==obj2:
+                return True
+    for obj1 in hash_map[id1][2]:
+        for obj2 in hash_map[id2][2]:
+            if obj1==obj2:
+                return True
+    return False
+
+def TryMergeAllCS():
+    global union_cnt
+    for i in range(0,union_cnt):
+        for j in range(i+1,union_cnt):
+            pi=Find(i)
+            pj=Find(j)
+            if(pi!=pj and CanMerge(i,j)):
+                Merge(pi,pj)
+
 def RecordCS(ctx, data, size):
     try:
+        global b
         global enabled
+        global tot_time
         global locks
         global files
-        global cs_files
-        global b
+        #global cs_files
         event = b["cs_events"].event(data)
         #global ts
         #ts=event.ts
-        #---update lock state
+        #---update rsrc state
         enabled[ct.c_int(0)] = ct.c_int(0)
         UpdateLock(locks)
         locks.clear()
@@ -585,29 +662,31 @@ def RecordCS(ctx, data, size):
         files.clear()
         UpdateSock(socks)
         socks.clear()
-        print(len(hash_map))
+        enabled[ct.c_int(0)] = ct.c_int(1)
+        #data info and eBPF info
+        print("Hash map size: %d\n"%(len(hash_map)),end="")
         all_len=0
         for k,v in hash_map.items():
             all_len+=len(v[0])
             all_len+=len(v[1])
             all_len+=len(v[2])
-        print(all_len)
+        print("Hash map items count: %d\n"%(all_len),end="")
         '''
         print("\n\n\n\n")
         for k,v in cs_files.items():
             print(k.id)
             print(k.inode)
         print("\n\n\n\n")        '''
-        enabled[ct.c_int(0)] = ct.c_int(1)
+        print("Total eBPF time: %f ms\n\n"%(float(tot_time[ct.c_int(0)].value)/1000000), end="")
+
 
         #---output cs
-
         stack_traces = b['stack_traces']
         #text section addr
         stext = b.ksymname('_stext')
 
         #print("======================================================================")
-        print("TASK: %s (pid %5d tid %5d) Total Time: %-9.3fus\n\n" % (event.comm, \
+        print("TASK: %s (pid %5d tid %5d) Total CS Time: %-9.3fus\n" % (event.comm, \
             (event.id >> 32), (event.id & 0xffffffff), float(event.time) / 1000), end="")
         print("Section start: {} -> {}".format(b.ksym(stext + event.addrs[0]), b.ksym(stext + event.addrs[1])))
         print("Section end:   {} -> {}".format(b.ksym(stext + event.addrs[2]), b.ksym(stext + event.addrs[3])))
@@ -625,15 +704,60 @@ def RecordCS(ctx, data, size):
             print("NO STACK FOUND DUE TO COLLISION")
         print("======================================================================")
         print("")
+        #update CS group
+        global CS_id_to_pos 
+        global union_cnt
+        global tid
+        global p
+        global sz
+        
+        cur_id=event.id
+        cur_cs_time=event.time
+        if (cur_id in CS_id_to_pos):
+            pos=CS_id_to_pos[cur_id]
+            pa=Find(pos)
+            sz[pa]+=cur_cs_time
+        else:
+            CS_id_to_pos[cur_id]=union_cnt
+            tid.append(cur_id)
+            p.append(union_cnt)
+            sz.append(cur_cs_time)
+            union_cnt=union_cnt+1
+
+        TryMergeAllCS()    
+
+        max_sz=0
+        idx=-1
+
+        for i in range(0,union_cnt):
+            pi=Find(i)
+            if pi==i and sz[i]>max_sz:
+                max_sz=sz[i]
+                idx=i
+
+
+        print("Longest CS group total time: %f us\n"%(float(sz[idx]) / 1000),end="")   
+        print("All tid in group:")
+        for i in range(0,union_cnt):
+            if p[i]==idx:
+                iid=tid[i]
+                print("pid %5d tid %5d\n" % ((iid >> 32), (iid & 0xffffffff)),end="")
+                
     except Exception:
         sys.exit(0)
         
         
 
 #------------------------------main loop--------------------------#
-
+# basic data and structure
 hash_map={}
-
+boot_t=psutil.boot_time()
+CS_id_to_pos = {}#id to union_set position
+union_cnt=0
+tid=[]
+p=[]
+sz=[]
+#BPF attach
 b = BPF(text=bpf_text)
 
 b.attach_kprobe(event="_raw_spin_unlock", fn_name="unlock_enter")
@@ -646,12 +770,16 @@ b.attach_kprobe(event="vfs_write", fn_name="vfs_read_write")
 
 b.attach_kprobe(event="sock_sendmsg", fn_name="sock_recv_sends_msg_enter")
 b.attach_kprobe(event="sock_recvmsg", fn_name="sock_recv_sends_msg_enter")
+
+#BPF map
 b["cs_events"].open_ring_buffer(RecordCS)
 enabled = b["enabled"]
+tot_time=b["tot_time"]
 locks=b["lock_hash"]
 files=b["file_hash"]
 socks=b["sock_hash"]
 #cs_files=b["cs_file_hash"]
+
 ts=0#time start
 
 print("Finding critical section with {} disabled for > {}us".format( \
