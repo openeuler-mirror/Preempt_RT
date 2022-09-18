@@ -1,16 +1,15 @@
-# 本程序是基于epbf+bcc开发的，对内核中断关闭状态时长进行监测的探针
-# 参考了bcc提供的工具中的criticalstat.py
+# 本程序是基于eBPF+BCC开发的，对内核中断关闭状态时长进行监测的探针
 
-# 运行前请确保
-# 1、根据[bcc官方仓库安装说明]中的说明，以源码方式安装了最新版的bcc以及相关库并成功运行实例程序
-# 2、linux内核版本>5.xxxx以支持新版ebpf特性
-# 3、在PREEMPTIRQ.....配置下构建linux内核（xx和XX可以任选一个或选两个）
+# 运行前请确保:
+# 1、根据 https://github.com/iovisor/bcc/blob/master/INSTALL.md 中的说明，以源码方式安装了最新版的BCC以及相关库并成功运行实例程序
+# 2、linux内核版本大于5.8,以支持新版eBPF特性
+# 3、在CONFIG_PREEMPTIRQ_TRACEPOINTS、CONGIF_DEBUG_PREEMPT、CONFIG_PREEMPT_TRACER配置选项及其依赖下构建linux内核
 
-# 使用方法: [sudo] [python3] probe.py [-h] [-p] [-i] [-d DURATION]
+# 使用方法: [sudo] [python3] probe.py [-p] [-i] [-d DURATION]
 
-# By c0dend
+# 2022 杨盾 c0dend
 
-from __future__ import print_function
+
 from bcc import BPF
 import argparse
 import sys
@@ -37,8 +36,6 @@ parser.add_argument("-i", "--irqoff", action="store_true",
 parser.add_argument("-d", "--duration", default=500,
                     help="Filter duration below this(us)")
 
-parser.add_argument("-g", "--giveup", default=1000,
-                    help="resource giveup time(ms)")
 
 args = parser.parse_args()
 
@@ -50,9 +47,9 @@ if args.irqoff:
 if args.preemptoff:
     preemptoff = True
 
+# default probe irpoff
 if (not args.irqoff) and (not args.preemptoff):
     irqoff = True
-    #preemptoff = True
 
 # open subprocess to output kernal debugfs path
 debugfs_path = subprocess.Popen ("cat /proc/mounts | grep -w debugfs" +
@@ -60,14 +57,14 @@ debugfs_path = subprocess.Popen ("cat /proc/mounts | grep -w debugfs" +
     shell=True,
     stdout=subprocess.PIPE).stdout.read().split(b"\n")[0]
 
-#unable to find document
+# unable to find document
 if debugfs_path == "":
     print("ERROR: Unable to find debugfs mount point");
     sys.exit(0)
 
 trace_path = debugfs_path + b"/tracing/events/preemptirq/";
 
-#unable to find tracepoint
+# unable to find tracepoint
 if irqoff:
     if (not os.path.exists(trace_path + b"irq_disable") or
         not os.path.exists(trace_path + b"irq_enable")):
@@ -92,7 +89,7 @@ if preemptoff:
         "CONFIG_PROVE_LOCKING and CONFIG_LOCKDEP on older kernels.")
 
 
-#--------------------------output C program-------------------------#
+#--------------------------header file and data structure-------------------------#
 bpf_text="""
 #include<linux/spinlock_types.h>
 #include<linux/spinlock.h>
@@ -102,28 +99,33 @@ bpf_text="""
 #include<linux/fdtable.h>
 #include<linux/net.h>
 
+//if enabled storage
 BPF_ARRAY(enabled,   u64, 1);
+//record total eBPF time
 BPF_ARRAY(tot_time,   u64, 1);
 
+//storage lock data
 struct lock_data_t {
     u64 id;
     void *lock;
 };
 BPF_HASH(lock_hash,struct lock_data_t, u64,102400);
 
-
+//storage file data
 struct file_data_t {
     u64 id;
     u64 inode;
 };
 BPF_HASH(file_hash,struct file_data_t, u64,102400);
 
+//storage socket data
 struct sock_data_t {
     u64 id;
     void *sock;
 };
 BPF_HASH(sock_hash,struct sock_data_t, u64,102400);
 
+//stack trace address
 enum addr_offs {
     START_CALLER_OFF,
     START_PARENT_OFF,
@@ -131,7 +133,7 @@ enum addr_offs {
     END_PARENT_OFF
 };
 
-//data struct in sts to record in_disable stat and if in_idle
+//data structure to record in_disable stat and if in_idle
 struct start_data {
     u32 addr_offs[2];
     u64 ts;
@@ -139,53 +141,30 @@ struct start_data {
     int active;//active: in disable
 };
 
-//output data
+//CS output data, CS(critical section, refer to criticalstat.py from BCC/tools)
 struct cs_data_t {
-    u64 ts;
-    u64 time;
+    u64 ts;            //time start
+    u64 time;          //time diff
     s64 stack_id;
     u32 cpu;
     u64 id;
-    u32 addrs[4];   /* indexed by addr_offs */
+    u32 addrs[4];      //indexed by addr_offs 
     char comm[TASK_COMM_LEN];
 
 };
 
+//used to output CS info
 BPF_STACK_TRACE(stack_traces, 16384);
 BPF_PERCPU_ARRAY(sts, struct start_data, 1);
 BPF_PERCPU_ARRAY(isidle, u64, 1);
 BPF_RINGBUF_OUTPUT(cs_events,256);
 
-/*
-struct cs_file_data_t {
-    u64 id;
-    u64 inode;
-};*/
-//BPF_HASH(cs_file_hash,struct cs_file_data_t, u64,102400);
-//BPF_ARRAY(cs_file_array,struct cs_file_data_t,102400);
-
 
 """
 #--------------------------CS C program-------------------------#
 fixed_cs_prog = """
-/*
- * In the below code we install tracepoint probes on preempt or
- * IRQ disable/enable critical sections and idle events, the cases
- * are combinations of 4 different states.
- * The states are defined as:
- * CSenter: A critical section has been entered. Either due to
- *          preempt disable or irq disable.
- * CSexit: A critical section has been exited. Either due to
- *         preempt enable or irq enable.
- * Ienter: The CPU has entered an idle state.
- * Iexit: The CPU has exited an idle state.
- *
- * The scenario we are trying to detect is if there is an overlap
- * between Critical sections and idle entry/exit. If there are any
- * such cases, we avoid recording those critical sections since they
- * are not worth while to record and just add noise.
- */
- 
+
+//record current time to total time
 static void AddToTalTime(u64 st_time)
 {
     int key = 0;
@@ -198,6 +177,9 @@ static void AddToTalTime(u64 st_time)
     }
 
 }
+
+//trace idle state to avoid recording critical sections overlapping with idle
+//refer to criticalstat.py
 TRACEPOINT_PROBE(power, cpu_idle)
 {
     u64 st_time=bpf_ktime_get_ns();
@@ -211,12 +193,6 @@ TRACEPOINT_PROBE(power, cpu_idle)
     // Handle the case CSenter, Ienter, Iexit, CSexit
     stdp = sts.lookup(&idx);
     if (stdp && stdp->active) {
-        /*
-         * Due to verifier issues, we have to copy contents
-         * of stdp onto the stack before the update.
-         * Fix it to directly update once kernel patch d71962f
-         * becomes more widespread.
-         */
         std = *stdp;
         std.idle_skip = 1;
         sts.update(&idx, &std);
@@ -247,7 +223,7 @@ static int in_idle(void)
     return 0;
 }
 
-//reset start_data to sts
+//reset start_data
 static void reset_state(void)
 {
     int idx = 0;
@@ -259,6 +235,9 @@ static void reset_state(void)
 """
 changed_cs_prog = """
 
+//some of the content will changed depending on tracepoints we need
+
+//disable will record start info
 TRACEPOINT_PROBE(preemptirq, TYPE_disable)
 {
     u64 st_time=bpf_ktime_get_ns();
@@ -268,7 +247,7 @@ TRACEPOINT_PROBE(preemptirq, TYPE_disable)
     // Handle the case Ienter, CSenter, CSexit, Iexit
     // Handle the case Ienter, CSenter, Iexit, CSexit
     if (in_idle()) {
-        //in idle, skip this trace, reset sts state
+        //in idle, skip this trace, reset state
         reset_state();
         AddToTalTime(st_time);
         return 0;
@@ -288,7 +267,7 @@ TRACEPOINT_PROBE(preemptirq, TYPE_disable)
     return 0;
 }
 
-
+//enable will output recorded info
 TRACEPOINT_PROBE(preemptirq, TYPE_enable)
 {
     u64 st_time=bpf_ktime_get_ns();
@@ -344,54 +323,7 @@ TRACEPOINT_PROBE(preemptirq, TYPE_enable)
 
     u64 id = bpf_get_current_pid_tgid();
     struct cs_data_t cs_data = {};
-    
-    /* There is trying to get file info from enable func
-    //get file from task
-    struct task_struct *cur=(struct task_struct *)bpf_get_current_task();
-    struct files_struct *fs;
-    bpf_probe_read_kernel(&fs,sizeof(fs),&(cur->files));
-    struct fdtable *fdt;
-    bpf_probe_read_kernel(&fdt,sizeof(fdt),&(fs->fdt));
-    u32 limit;
-    bpf_probe_read_kernel(&limit,sizeof(limit),&(fdt->max_fds));
-    u64 *mask;
-    bpf_probe_read_kernel(&mask,sizeof(mask),&(fdt->open_fds));
-    struct file** fds;
-    bpf_probe_read_kernel(&fds,sizeof(fds),&(fdt->fd));
-    
-    struct cs_file_data_t cur_cs_file={id,0};
-    u32 i=0;
 
-    while(i<1)
-    {
-        if(i>=limit) break;
-        u64 bias=i/64;
-        u64 digit=i%64;
-        if(((*(mask+bias))>>digit)&1)
-        {
-            struct file* f;
-            f=fds[i];
-            //bpf_probe_read_kernel(&f,sizeof(f),&(fds[i]));
-            struct inode *inod;
-            inod=f->f_inode;
-            //bpf_probe_read_kernel(&inod,sizeof(inod),f->f_inode);
-            u64 ino;
-            ino=inod->i_ino;
-            //bpf_probe_read_kernel(&ino,sizeof(ino),&inod->i_ino);
-            cur_cs_file.inode=ino;
-            //cur_cs_file.inode=BPF_CORE_READ(f,d_inode,i_ino);
-            //bpf_probe_read(&cur_cs_file.inode,sizeof(ino),&ino);
-            //cs_file_hash.update(&cur_cs_file, &end_ts); 
-            //cs_file_array.update(&cur_cs_file); 
-
-        } 
-        //cs_file_hash.update(&cur_cs_file, &end_ts); 
-        i++;      
-    }
-    */
-
-
-    
     //get info
     if (bpf_get_current_comm(&cs_data.comm, sizeof(cs_data.comm)) == 0) {
         cs_data.addrs[START_CALLER_OFF] = stdp->addr_offs[START_CALLER_OFF];
@@ -407,13 +339,11 @@ TRACEPOINT_PROBE(preemptirq, TYPE_enable)
         cs_events.ringbuf_output(&cs_data, sizeof(cs_data),0);
     }
 
-
     reset_state();
     AddToTalTime(st_time);
     return 0;
 }
 """
-
 
 bpf_text=bpf_text+fixed_cs_prog
 changed_cs_prog = changed_cs_prog.replace('DURATION', '{}'.format(int(args.duration) * 1000))
@@ -424,9 +354,9 @@ if preemptoff:
 if irqoff:
     bpf_text = bpf_text+changed_cs_prog.replace('TYPE', 'irq')
 
+
 #--------------------------spin_unlock C program-------------------------#
 lock_prog="""
-
 
 static bool is_enabled(void)
 {
@@ -444,23 +374,6 @@ int unlock_enter(struct pt_regs *ctx,struct spinlock_t *lock)
     if (!is_enabled())
         return 0;
     u64 st_time=bpf_ktime_get_ns();
-    /*
-    int idx = 0;
-    struct start_data *stdp;
-    if (in_idle()) {
-        return 0;
-    }
-    stdp = sts.lookup(&idx);
-    if (!stdp) {
-        return 0;
-    }
-    if (!stdp->active) {
-        return 0;
-    }
-    if (stdp->idle_skip) {
-        return 0;
-    }
-    */
     
     u64 id = bpf_get_current_pid_tgid();
 
@@ -484,29 +397,12 @@ bpf_text=bpf_text+lock_prog
 file_prog="""
 
 
-int vfs_read_write(struct pt_regs *ctx,struct file *file)
+int vfs_read_write_enter(struct pt_regs *ctx,struct file *file)
 {
 
     if (!is_enabled())
         return 0;
     u64 st_time=bpf_ktime_get_ns();
-    /*
-    int idx = 0;
-    struct start_data *stdp;
-    if (in_idle()) {
-        return 0;
-    }
-    stdp = sts.lookup(&idx);
-    if (!stdp) {
-        return 0;
-    }
-    if (!stdp->active) {
-        return 0;
-    }
-    if (stdp->idle_skip) {
-        return 0;
-    }
-    */
     
     u64 id = bpf_get_current_pid_tgid();
 
@@ -524,12 +420,11 @@ int vfs_read_write(struct pt_regs *ctx,struct file *file)
 bpf_text=bpf_text+file_prog
 
     
-    
 #--------------------------sock C program-------------------------#
 sock_prog="""
 
 
-int sock_recv_sends_msg_enter(struct pt_regs *ctx,struct socket *sock,struct msghdr *msg)
+int sock_recv_send_msg_enter(struct pt_regs *ctx,struct socket *sock,struct msghdr *msg)
 {
 
     if (!is_enabled())
@@ -553,6 +448,7 @@ bpf_text=bpf_text+sock_prog
 
     
 #-------------------func--------------------#
+# trace stack
 def get_syms(kstack):
     syms = []
 
@@ -562,49 +458,53 @@ def get_syms(kstack):
 
     return syms
 
+#update resource data
 def UpdateLock(locks):
-    #global ts
     global hash_map
     for k,v in locks.items():
         if not (k.id in hash_map):
             hash_map[k.id]=[{},{},{}]
-        hash_map[k.id][0][k.lock]=float(v.value)
-            
-        #if v.value>=ts:#only print in CS resource
-        print("(pid %5d tid %5d) time: %s lockaddr: %#x\n\n" % \
-            ((k.id >> 32), (k.id & 0xffffffff), (time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(boot_t+float(v.value)/1000000000))) ,k.lock), end="")
-    print("----------------------------------------------------------------------")
+        if not (k.lock in hash_map[k.id][0]):
+            hash_map[k.id][0][k.lock]=[]
+        hash_map[k.id][0][k.lock].append(v.value)
+
+        #print("(pid %5d tid %5d) time: %s lockaddr: %#x\n\n" % \
+        #    ((k.id >> 32), (k.id & 0xffffffff), (time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(boot_t+float(v.value)/1000000000))) ,k.lock), end="")
+    #print("----------------------------------------------------------------------")
         
 def UpdateFile(files):
-    #global ts
     global hash_map
     for k,v in files.items():
         if not (k.id in hash_map):
             hash_map[k.id]=[{},{},{}]
-        hash_map[k.id][1][k.inode]=float(v.value)
-        #if v.value>=ts:#only print in CS resource
-        print("(pid %5d tid %5d) time: %s fileino: %d\n\n" % \
-            ((k.id >> 32), (k.id & 0xffffffff), (time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(boot_t+float(v.value)/1000000000))),k.inode), end="")
-    print("----------------------------------------------------------------------")
+        if not (k.inode in hash_map[k.id][1]):
+            hash_map[k.id][1][k.inode]=[]
+        hash_map[k.id][1][k.inode].append(v.value)
+
+        #print("(pid %5d tid %5d) time: %s fileino: %d\n\n" % \
+        #    ((k.id >> 32), (k.id & 0xffffffff), (time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(boot_t+float(v.value)/1000000000))),k.inode), end="")
+    #print("----------------------------------------------------------------------")
         
 def UpdateSock(socks):
-    #global ts
     global hash_map
     for k,v in socks.items():
         if not (k.id in hash_map):
             hash_map[k.id]=[{},{},{}]
-        hash_map[k.id][2][k.sock]=float(v.value)
-        #if v.value>=ts:#only print in CS resource
-        print("(pid %5d tid %5d) time: %s sockaddr: %#x\n\n" % \
-            ((k.id >> 32), (k.id & 0xffffffff), (time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(boot_t+float(v.value)/1000000000))),k.sock), end="")
-    print("----------------------------------------------------------------------")
-# process cs_event
+        if not (k.sock in hash_map[k.id][2]):
+            hash_map[k.id][2][k.sock]=[]
+        hash_map[k.id][2][k.sock].append(v.value)
+        #print("(pid %5d tid %5d) time: %s sockaddr: %#x\n\n" % \
+        #    ((k.id >> 32), (k.id & 0xffffffff), (time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(boot_t+float(v.value)/1000000000))),k.sock), end="")
+    #print("----------------------------------------------------------------------")
+
+# union set find func
 def Find(pos):
     global p
     if p[pos]!=pos:
         p[pos]=Find(p[pos])
     return p[pos]
-    
+
+# union set merge func
 def Merge(a,b):
     global p
     global sz
@@ -614,26 +514,93 @@ def Merge(a,b):
         p[pa]=pb
         sz[pb]+=sz[pa]
 
+# if got resource time in CS
+def InCS(pos,t):
+    global start_end_pair
+    if t>=start_end_pair[pos][0] and t<=start_end_pair[pos][1]:
+        return True
+    return False
+
+# if two CS can merge (have edge)
 def CanMerge(i,j):
-    global CS_id_to_pos 
+    # have resource in CS and shared with others
     global tid
     global hash_map
+    global start_end_pair
     id1=tid[i]
     id2=tid[j]
-    for obj1 in hash_map[id1][0]:
+    
+    all_obj1=[]
+    all_obj2=[]
+    for obj1,v1 in hash_map[id1][0].items():
+        for t1 in v1:
+            if InCS(i,t1):
+                all_obj1.append(obj1)
+    
+    for obj2,v2 in hash_map[id2][0].items():
+        for t2 in v2:
+            if InCS(j,t2):
+                all_obj2.append(obj2)
+            
+    for obj1 in all_obj1:
         for obj2 in hash_map[id2][0]:
             if obj1==obj2:
                 return True
-    for obj1 in hash_map[id1][1]:
+
+    for obj1 in hash_map[id1][0]:
+        for obj2 in all_obj2:
+            if obj1==obj2:
+                return True
+
+            
+    all_obj1=[]
+    all_obj2=[]
+    for obj1,v1 in hash_map[id1][1].items():
+        for t1 in v1:
+            if InCS(i,t1):
+                all_obj1.append(obj1)
+    
+    for obj2,v2 in hash_map[id2][1].items():
+        for t2 in v2:
+            if InCS(j,t2):
+                all_obj2.append(obj2)
+            
+    for obj1 in all_obj1:
         for obj2 in hash_map[id2][1]:
             if obj1==obj2:
                 return True
-    for obj1 in hash_map[id1][2]:
+
+    for obj1 in hash_map[id1][1]:
+        for obj2 in all_obj2:
+            if obj1==obj2:
+                return True
+
+                       
+    all_obj1=[]
+    all_obj2=[]
+    for obj1,v1 in hash_map[id1][2].items():
+        for t1 in v1:
+            if InCS(i,t1):
+                all_obj1.append(obj1)
+    
+    for obj2,v2 in hash_map[id2][2].items():
+        for t2 in v2:
+            if InCS(j,t2):
+                all_obj2.append(obj2)
+            
+    for obj1 in all_obj1:
         for obj2 in hash_map[id2][2]:
             if obj1==obj2:
                 return True
+
+    for obj1 in hash_map[id1][2]:
+        for obj2 in all_obj2:
+            if obj1==obj2:
+                return True
+
     return False
 
+# update the graph
 def TryMergeAllCS():
     global union_cnt
     for i in range(0,union_cnt):
@@ -643,6 +610,7 @@ def TryMergeAllCS():
             if(pi!=pj and CanMerge(i,j)):
                 Merge(pi,pj)
 
+# have new CS output, update the graph and show the new CS info and max_time CS group info
 def RecordCS(ctx, data, size):
     try:
         global b
@@ -650,11 +618,17 @@ def RecordCS(ctx, data, size):
         global tot_time
         global locks
         global files
-        #global cs_files
+        global hash_map
+        global union_cnt
+        global tid
+        global p
+        global sz
+        global sz_self
+        global start_end_pair
+
         event = b["cs_events"].event(data)
-        #global ts
-        #ts=event.ts
-        #---update rsrc state
+
+        # update all resources
         enabled[ct.c_int(0)] = ct.c_int(0)
         UpdateLock(locks)
         locks.clear()
@@ -663,66 +637,85 @@ def RecordCS(ctx, data, size):
         UpdateSock(socks)
         socks.clear()
         enabled[ct.c_int(0)] = ct.c_int(1)
-        #data info and eBPF info
-        print("Hash map size: %d\n"%(len(hash_map)),end="")
+        
+        # data info and eBPF info
+        print("\n\n")
+        print("Statistical info:")
+        print("  Hash map size: %d\n"%(len(hash_map)),end="")
         all_len=0
         for k,v in hash_map.items():
             all_len+=len(v[0])
             all_len+=len(v[1])
             all_len+=len(v[2])
-        print("Hash map items count: %d\n"%(all_len),end="")
-        '''
-        print("\n\n\n\n")
-        for k,v in cs_files.items():
-            print(k.id)
-            print(k.inode)
-        print("\n\n\n\n")        '''
-        print("Total eBPF time: %f ms\n\n"%(float(tot_time[ct.c_int(0)].value)/1000000), end="")
+        print("  Hash map items count: %d\n"%(all_len),end="")
 
+        print("  Total eBPF time: %f ms\n"%(float(tot_time[ct.c_int(0)].value)/1000000), end="")
+        print("======================================================================")
 
-        #---output cs
+        # output cs info
+        print("New CS info:")
+        # stack trace
         stack_traces = b['stack_traces']
         #text section addr
         stext = b.ksymname('_stext')
 
         #print("======================================================================")
-        print("TASK: %s (pid %5d tid %5d) Total CS Time: %-9.3fus\n" % (event.comm, \
+        print("  TASK: %s (pid %5d tid %5d) Total CS Time: %-9.3fus\n" % (event.comm, \
             (event.id >> 32), (event.id & 0xffffffff), float(event.time) / 1000), end="")
-        print("Section start: {} -> {}".format(b.ksym(stext + event.addrs[0]), b.ksym(stext + event.addrs[1])))
-        print("Section end:   {} -> {}".format(b.ksym(stext + event.addrs[2]), b.ksym(stext + event.addrs[3])))
+        print("  Section start: {} -> {}".format(b.ksym(stext + event.addrs[0]), b.ksym(stext + event.addrs[1])))
+        print("  Section end:   {} -> {}".format(b.ksym(stext + event.addrs[2]), b.ksym(stext + event.addrs[3])))
         if event.stack_id >= 0:
-            print("STACK TRACE RESULT")
+            print("  STACK TRACE RESULT")
             kstack = stack_traces.walk(event.stack_id)
             syms = get_syms(kstack)
             if not syms:
                 return
 
             for s in syms:
-                print("  ", end="")
+                print("    ", end="")
                 print("%s" % s)
         else:
             print("NO STACK FOUND DUE TO COLLISION")
+            
+        # all resource of new CS
+        idx=event.id
+        print("  All resources:")
+        print("  lockaddr:",end="")
+        tcnt=0
+        for k in hash_map[idx][0]:
+            if(tcnt%8==0):
+                print("\n    ",end="")
+            print("%#x "%k,end="")
+            tcnt+=1
+        print("\n",end="")
+        print("  fileino:",end="")
+        tcnt=0
+        for k in hash_map[idx][1]:
+            if(tcnt%10==0):
+                print("\n    ",end="")
+            print("%d "%k,end="")
+            tcnt+=1
+        print("\n",end="")
+        print("  sockaddr:",end="")
+        tcnt=0
+        for k in hash_map[idx][2]:
+            if(tcnt%8==0):
+                print("\n    ",end="")
+            print("%#x "%k,end="")
+            tcnt+=1
+        print("\n",end="")
         print("======================================================================")
-        print("")
-        #update CS group
-        global CS_id_to_pos 
-        global union_cnt
-        global tid
-        global p
-        global sz
-        
+
+        # update CS group
         cur_id=event.id
         cur_cs_time=event.time
-        if (cur_id in CS_id_to_pos):
-            pos=CS_id_to_pos[cur_id]
-            pa=Find(pos)
-            sz[pa]+=cur_cs_time
-        else:
-            CS_id_to_pos[cur_id]=union_cnt
-            tid.append(cur_id)
-            p.append(union_cnt)
-            sz.append(cur_cs_time)
-            union_cnt=union_cnt+1
+
+        tid.append(cur_id)
+        p.append(union_cnt)
+        sz.append(cur_cs_time)
+        sz_self.append(cur_cs_time)
+        start_end_pair.append([event.ts,event.ts+cur_cs_time])
+        union_cnt=union_cnt+1
 
         TryMergeAllCS()    
 
@@ -735,41 +728,58 @@ def RecordCS(ctx, data, size):
                 max_sz=sz[i]
                 idx=i
 
-
-        print("Longest CS group total time: %f us\n"%(float(sz[idx]) / 1000),end="")   
-        print("All tid in group:")
+        # output max_time CS group info (max connected component and it's nodes and edges)
+        print("Longest CS group total time: %-9.3fus\n"%(float(sz[idx]) / 1000),end="")   
+        print("All thread in group:")
+        pos_in_group=[]
         for i in range(0,union_cnt):
             if p[i]==idx:
+                pos_in_group.append(i)
                 iid=tid[i]
-                print("pid %5d tid %5d\n" % ((iid >> 32), (iid & 0xffffffff)),end="")
-                
+                print("  pid %5d tid %5d CS Time: %-9.3fus\n" % ((iid >> 32), (iid & 0xffffffff),float(sz_self[i])/1000),end="")
+        print("Share common resource:")
+        tsz=len(pos_in_group)
+        for i in range(0,tsz):
+            for j in range(i+1,tsz):
+                if CanMerge(pos_in_group[i],pos_in_group[j]):
+                    print("  pid %5d tid %5d (%-9.3fus) " % ((tid[pos_in_group[i]] >> 32), (tid[pos_in_group[i]]  & 0xffffffff),float(sz_self[i])/1000),end="")
+                    print(" and ",end="")
+                    print("  pid %5d tid %5d (%-9.3fus) " % ((tid[pos_in_group[j]]  >> 32), (tid[pos_in_group[j]]  & 0xffffffff),float(sz_self[j])/1000),end="\n")
+                    
+        print("======================================================================")
     except Exception:
         sys.exit(0)
         
         
 
 #------------------------------main loop--------------------------#
+
 # basic data and structure
+
+# hash_map record resources by id (pid+tid)
 hash_map={}
 boot_t=psutil.boot_time()
-CS_id_to_pos = {}#id to union_set position
+# union_set with sz(CS time)
 union_cnt=0
 tid=[]
 p=[]
-sz=[]
+sz=[]#cs_size_group
+sz_self=[]#cs_size_self
+start_end_pair=[]#cs_start_and_end_time
+
 #BPF attach
 b = BPF(text=bpf_text)
 
 b.attach_kprobe(event="_raw_spin_unlock", fn_name="unlock_enter")
 
-b.attach_kprobe(event="vfs_read", fn_name="vfs_read_write")
-b.attach_kprobe(event="vfs_write", fn_name="vfs_read_write")
+b.attach_kprobe(event="vfs_read", fn_name="vfs_read_write_enter")
+b.attach_kprobe(event="vfs_write", fn_name="vfs_read_write_enter")
 #after verify vfs_read/write call __vfs_read/write but cannot attach
-#b.attach_kprobe(event="__vfs_read", fn_name="vfs_read_write")
-#b.attach_kprobe(event="__vfs_write", fn_name="vfs_read_write")
+#b.attach_kprobe(event="__vfs_read", fn_name="vfs_read_write_enter")
+#b.attach_kprobe(event="__vfs_write", fn_name="vfs_read_write_enter")
 
-b.attach_kprobe(event="sock_sendmsg", fn_name="sock_recv_sends_msg_enter")
-b.attach_kprobe(event="sock_recvmsg", fn_name="sock_recv_sends_msg_enter")
+b.attach_kprobe(event="sock_sendmsg", fn_name="sock_recv_send_msg_enter")
+b.attach_kprobe(event="sock_recvmsg", fn_name="sock_recv_send_msg_enter")
 
 #BPF map
 b["cs_events"].open_ring_buffer(RecordCS)
@@ -778,7 +788,7 @@ tot_time=b["tot_time"]
 locks=b["lock_hash"]
 files=b["file_hash"]
 socks=b["sock_hash"]
-#cs_files=b["cs_file_hash"]
+
 
 ts=0#time start
 
@@ -789,14 +799,7 @@ print("Finding critical section with {} disabled for > {}us".format( \
 enabled[ct.c_int(0)] = ct.c_int(1)
 while 1:
     try:
-
-        #time.sleep(1)
-
-
-        #get a cs
         b.ring_buffer_poll()
-
-
 
     except KeyboardInterrupt:
         exit()

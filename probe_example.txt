@@ -1,0 +1,114 @@
+probe.py的说明：
+
+probe.py是对linux内核进入中断关闭状态进行监测的探针程序。
+参考了BCC仓库下提供的criticalstat.py工具。
+
+主要功能有：
+1、对中断关闭状态进行监测，并记录超过一定阈值的中断关闭状态。
+2、记录中断关闭时长、调用栈、pid、tid、持有锁、文件、socket等信息。
+3、根据各个中断关闭状态对资源的争抢情况，建立图模型。
+     将中断关闭状态视为点，有对同一资源的争抢则连边，构建中断关闭状态进程关系图。
+     点的权重为中断关闭状态时长，基于并查集维护图模型的联通分量。
+     在获取新的中断关闭状态后，更新整个图模型，并输出最大中断关闭时长进程组(最大联通分量)的信息。
+
+在运行前请确保：
+1、根据 https://github.com/iovisor/bcc/blob/master/INSTALL.md 中的说明，以源码方式安装了最新版的BCC以及相关库并成功运行实例程序
+2、linux内核版本大于5.8,以支持新版eBPF特性
+3、在CONFIG_PREEMPTIRQ_TRACEPOINTS、CONGIF_DEBUG_PREEMPT、CONFIG_PREEMPT_TRACER配置选项及其依赖下构建linux内核
+
+使用方法说明：
+[sudo] [python3] ./probe.py [-i] [-p]  [-d DURATION]
+选项说明：
+    -i 追踪irqoff状态（默认选项）
+    -p 追踪preemptoff状态
+    -d DURATION 对中断关闭状态的时长(us)进行筛选，默认值为500
+
+示例：
+    sudo python3 ./probe.py
+    sudo python3 ./probe.py -i
+    sudo python3 ./probe.py -d 200
+    sudo python3 ./probe.py -p -d 400
+
+程序按 Ctrl -C 结束。
+注意：由于eBPF中ringbuffer在更新时会屏蔽键盘中断，故过小的阈值可能会导致程序难以停止，以及可能需要多次按 Ctrl -C 停止程序。
+
+
+运行结果示例：    
+sudo python3 ./probe.py -i -d 300
+
+初始：
+Finding critical section with IRQ disabled for > 300us
+
+探测到第一个经过筛选的中断关闭状态：
+Statistical info:
+  Hash map size: 125
+  Hash map items count: 4533
+  Total eBPF time: 103.217043 ms
+======================================================================
+New CS info:
+  TASK: b'kworker/0:2' (pid 10602 tid 10602) Total CS Time: 326.443  us
+  Section start: b'_raw_spin_lock_irqsave' -> b'e1000_update_stats'
+  Section end:   b'_raw_spin_unlock_irqrestore' -> b'e1000_update_stats'
+  STACK TRACE RESULT
+    b'trace_hardirqs_on+0xae'
+    b'trace_hardirqs_on+0xae'
+    b'_raw_spin_unlock_irqrestore+0x4e'
+    b'e1000_update_stats+0x6d0'
+    b'e1000_watchdog+0xc1'
+    b'process_one_work+0x21a'
+    b'worker_thread+0x4a'
+    b'kthread+0xfd'
+    b'ret_from_fork+0x1f'
+  All resources:
+  lockaddr:
+    0xffffffffa7fbf34c 0xffff937101d640a4 0xffff937199c31000 0xffff937199c30d00 0xffff937199c30a00 0xffffffffa7fbf330 
+  fileino:
+  sockaddr:
+======================================================================
+Longest CS group total time: 326.443  us
+All thread in group:
+  pid 10602 tid 10602 CS Time: 326.443  us
+Share common resource:
+======================================================================
+
+
+
+运行一段时间后：
+Statistical info:
+  Hash map size: 251
+  Hash map items count: 20756
+  Total eBPF time: 474.276422 ms
+======================================================================
+New CS info:
+  TASK: b'python3' (pid 12063 tid 12063) Total CS Time: 3190.491 us
+  Section start: b'irqentry_enter_from_user_mode' -> b'irqentry_enter'
+  Section end:   b'__do_softirq' -> b'irq_exit_rcu'
+  STACK TRACE RESULT
+    b'trace_hardirqs_on+0xae'
+    b'trace_hardirqs_on+0xae'
+    b'__do_softirq+0xaf'
+    b'irq_exit_rcu+0xbc'
+    b'sysvec_apic_timer_interrupt+0x47'
+    b'asm_sysvec_apic_timer_interrupt+0x12'
+  All resources:
+  lockaddr:
+    0xffffe375c5dc4da8 0xffffe375c5c14be8 0xffffe375c42a7968 0xffffe375c53560e8 0xffff937199c31000 0xffffe375c5c18be8 0xffffe375c42e8168 0xffffe375c5dc94a8 
+    0xffff937199c20c80 0xffffe375c0c38828 0xffffe375c0c6fd28 0xffffffffa7963940 0xffffe375c0c6ea68 0xffff93710c470e40 0xffff937199c30a00 0xffffffffa7807a00 
+    0xffffe375c5dc13e8 0xffffe375c0c6fce8 0xffffe375c0c6dc68 0xffff9371014ff9d8 0xffff93710004d000 0xffffffffa8060294 0xffff9371001c9ca4 0xffff937199c30d00 
+  fileino:
+    5 4026532067 
+  sockaddr:
+======================================================================
+Longest CS group total time: 10167.559us
+All thread in group:
+  pid 10602 tid 10602 CS Time: 326.443  us
+  pid  4276 tid  4295 CS Time: 6040.111 us
+  pid 11547 tid 11547 CS Time: 305.782  us
+  pid 10602 tid 10602 CS Time: 304.732  us
+  pid 12063 tid 12063 CS Time: 3190.491 us
+Share common resource:
+  pid 10602 tid 10602 (326.443  us)  and   pid 11547 tid 11547 (326.932  us) 
+  pid  4276 tid  4295 (6040.111 us)  and   pid 11547 tid 11547 (326.932  us) 
+  pid 11547 tid 11547 (326.932  us)  and   pid 10602 tid 10602 (305.782  us) 
+  pid 11547 tid 11547 (326.932  us)  and   pid 12063 tid 12063 (304.732  us) 
+======================================================================
