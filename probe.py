@@ -630,6 +630,7 @@ def RecordCS(ctx, data, size):
 
         # update all resources
         enabled[ct.c_int(0)] = ct.c_int(0)
+        d_time=tot_time[ct.c_int(0)].value
         tot_time[ct.c_int(0)] = ct.c_int(0)
         UpdateLock(locks)
         locks.clear()
@@ -650,7 +651,7 @@ def RecordCS(ctx, data, size):
             all_len+=len(v[2])
         print("  Hash map items count: %d\n"%(all_len),end="")
 
-        print("  Total eBPF time: %f ms\n"%(float(tot_time[ct.c_int(0)].value)/1000000), end="")
+        print("  Total eBPF time: %f ms\n"%(float(d_time)/1000000), end="")
         print("======================================================================")
 
         # output cs info

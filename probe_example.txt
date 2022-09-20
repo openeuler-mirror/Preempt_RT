@@ -47,33 +47,34 @@ CS(critical section)，即内核处于irq disabled或preemption disabled状态�
 
 探测到第一个经过筛选的中断关闭状态：
 Statistical info:
-  Hash map size: 53
-  Hash map items count: 404
-  Total eBPF time: 0.839884 ms
+  Hash map size: 26
+  Hash map items count: 198
+  Total eBPF time: 20.597369 ms
 ======================================================================
 New CS info:
-  TASK: b'kworker/0:1' (pid  4470 tid  4470) Total CS Time: 344.999  us
-  Section start: b'_raw_spin_lock_irqsave' -> b'e1000_update_stats'
-  Section end:   b'_raw_spin_unlock_irqrestore' -> b'e1000_update_stats'
+  TASK: b'python3' (pid  8784 tid  8784) Total CS Time: 309.843  us
+  Section start: b'irqentry_enter_from_user_mode' -> b'irqentry_enter'
+  Section end:   b'__do_softirq' -> b'irq_exit_rcu'
   STACK TRACE RESULT
     b'trace_hardirqs_on+0xae'
     b'trace_hardirqs_on+0xae'
-    b'_raw_spin_unlock_irqrestore+0x4e'
-    b'e1000_update_stats+0x6d0'
-    b'e1000_watchdog+0xc1'
-    b'process_one_work+0x21a'
-    b'worker_thread+0x4a'
-    b'kthread+0xfd'
-    b'ret_from_fork+0x1f'
+    b'__do_softirq+0xaf'
+    b'irq_exit_rcu+0xbc'
+    b'sysvec_apic_timer_interrupt+0x47'
+    b'asm_sysvec_apic_timer_interrupt+0x12'
   All resources:
   lockaddr:
-    0xffff980241bd66a4 0xffff9802d9c31000 
+    0xffffe89c012d05a8 0xffffe89c01819fe8 0xffffe89c0218f5a8 0xffff9802d9c31000 0xffffe89c00047068 0xffffe89c00d084a8 0xffffe89c01510168 0xffffe89c01ed38e8 
+    0xffffffff90d3ad50 0xffff98024004d000 0xffffe89c007392a8 0xffffffff90e60294 0xffffe89c00c6de68 0xffff9802414ff798 0xffff9801947edc00 0xffffffff90607a00 
+    0xffffe89c021872e8 0xffffe89c00732ae8 0xffffe89c010f8b28 0xffff9802d9c20c80 0xffffe89c00730de8 0xffffe89c0181b9e8 0xffff9802d9c30a00 0xffffffff90763940 
+    0xffffe89c0218f5e8 0xffffe89c00c6dee8 
   fileino:
+    4026532067 3015588 1458040 4 
   sockaddr:
 ======================================================================
-Longest CS group total time: 344.999  us
+Longest CS group total time: 309.843  us
 All thread in group:
-  pid  4470 tid  4470 CS Time: 344.999  us
+  pid  8784 tid  8784 CS Time: 309.843  us
 Share common resource:
 ======================================================================
 
@@ -101,50 +102,62 @@ graph info:
 
 
 运行一段时间后：
+
 Statistical info:
-  Hash map size: 164
-  Hash map items count: 9524
-  Total eBPF time: 11.209160 ms
+  Hash map size: 94
+  Hash map items count: 3327
+  Total eBPF time: 34.002808 ms
 ======================================================================
 New CS info:
-  TASK: b'gnome-shell' (pid  1951 tid  1951) Total CS Time: 550.979  us
-  Section start: b'irqentry_enter_from_user_mode' -> b'irqentry_enter'
-  Section end:   b'__do_softirq' -> b'irq_exit_rcu'
+  TASK: b'code' (pid  8519 tid  8519) Total CS Time: 350.478  us
+  Section start: b'__sched_text_start' -> b'schedule'
+  Section end:   b'finish_task_switch' -> b'__sched_text_start'
   STACK TRACE RESULT
     b'trace_hardirqs_on+0xae'
     b'trace_hardirqs_on+0xae'
-    b'__do_softirq+0xaf'
-    b'irq_exit_rcu+0xbc'
-    b'sysvec_apic_timer_interrupt+0x47'
-    b'asm_sysvec_apic_timer_interrupt+0x12'
+    b'finish_task_switch+0x93'
+    b'__sched_text_start+0x2fb'
+    b'schedule+0x58'
+    b'exit_to_user_mode_prepare+0xed'
+    b'syscall_exit_to_user_mode+0x38'
+    b'do_syscall_64+0x69'
+    b'entry_SYSCALL_64_after_hwframe+0x44'
   All resources:
   lockaddr:
-    0xffffffff90607a00 0xffff980247fda360 0xffff980247ffb360 0xffff980247ffb760 0xffff9802d9c31000 0xffff980247ffc760 0xffffffff90763940 0xffff9802d9c20c80 
-    0xffffffff90d3ad50 0xffff980247805c00 0xffff9802d9c30a00 0xffff98024871900c 0xffff98024871b00c 0xffff98024cda78a4 0xffff9802d9c30d00 0xffff9802d9c21f00 
-    0xffff9802478358e0 0xffffe89c012d3ae8 0xffff9802401c90a4 0xffff9802480d2358 0xffff9801a4211118 0xffff98024bb829d0 0xffff9802412ec308 0xffff98024bb824d0 
-    0xffffffff90e30fd8 0xffff98024bb82fd0 0xffff98024bb826d0 0xffff9801a4211c58 0xffff9801a37c8298 0xffff9801a4211ad8 0xffff9801a37c8dd8 0xffff9801a37c8898 
-    0xffff98024bb82ad0 0xffff980242ada2d0 
+    0xffffffff90607a00 0xffff98024029b4c4 0xffff980240298a04 0xffff98024029a404 0xffff9802d9c31000 0xffffe89c01818228 0xffffe89c042f3868 0xffffe89c00048528 
+    0xffffe89c01ee3428 0xffffe89c06476628 0xffff98024029adc4 0xffffe89c05c163a8 0xffffe89c01edcca8 
   fileino:
-    12600 28270 
+    76626 76643 
   sockaddr:
-    0xffff980248167a80 0xffff980248167400 
 ======================================================================
-Longest CS group total time: 10571.356us
+Longest CS group total time: 22120.710us
 All thread in group:
-  pid  3953 tid  3957 CS Time: 313.822  us
-  pid  5193 tid  5193 CS Time: 8201.530 us
-  pid  3979 tid  3979 CS Time: 307.524  us
-  pid  1951 tid  1951 CS Time: 341.651  us
-  pid  3979 tid  3979 CS Time: 555.506  us
-  pid  3979 tid  4549 CS Time: 300.344  us
-  pid  1951 tid  1951 CS Time: 550.979  us
+  pid  8784 tid  8784 CS Time: 309.843  us
+  pid  8519 tid  8521 CS Time: 8905.989 us
+  pid  8784 tid  8784 CS Time: 396.303  us
+  pid  8539 tid  8539 CS Time: 9498.158 us
+  pid  8519 tid  8521 CS Time: 323.732  us
+  pid  8784 tid  8784 CS Time: 320.464  us
+  pid  8784 tid  8784 CS Time: 311.929  us
+  pid  1689 tid  1689 CS Time: 331.255  us
+  pid  8784 tid  8784 CS Time: 322.239  us
+  pid  8519 tid  8521 CS Time: 365.194  us
+  pid  8519 tid  8521 CS Time: 338.670  us
+  pid  8784 tid  8784 CS Time: 346.456  us
+  pid  8519 tid  8519 CS Time: 350.478  us
 Share common resource:
-  pid  3953 tid  3957 (344.999  us)  and   pid  1951 tid  1951 (555.506  us) 
-  pid  5193 tid  5193 (354.423  us)  and   pid  1951 tid  1951 (555.506  us) 
-  pid  3979 tid  3979 (313.822  us)  and   pid  1951 tid  1951 (555.506  us) 
-  pid  1951 tid  1951 (8201.530 us)  and   pid  1951 tid  1951 (555.506  us) 
-  pid  3979 tid  3979 (307.524  us)  and   pid  1951 tid  1951 (555.506  us) 
-  pid  3979 tid  4549 (341.651  us)  and   pid  1951 tid  1951 (555.506  us) 
+  pid  8784 tid  8784 (309.843  us)  and   pid  1689 tid  1689 (311.929  us) 
+  pid  8519 tid  8521 (8905.989 us)  and   pid  1689 tid  1689 (311.929  us) 
+  pid  8784 tid  8784 (396.303  us)  and   pid  1689 tid  1689 (311.929  us) 
+  pid  8539 tid  8539 (345.770  us)  and   pid  1689 tid  1689 (311.929  us) 
+  pid  8519 tid  8521 (9498.158 us)  and   pid  1689 tid  1689 (311.929  us) 
+  pid  8784 tid  8784 (323.732  us)  and   pid  1689 tid  1689 (311.929  us) 
+  pid  8784 tid  8784 (320.464  us)  and   pid  1689 tid  1689 (311.929  us) 
+  pid  1689 tid  1689 (311.929  us)  and   pid  8784 tid  8784 (331.255  us) 
+  pid  1689 tid  1689 (311.929  us)  and   pid  8519 tid  8521 (322.239  us) 
+  pid  1689 tid  1689 (311.929  us)  and   pid  8519 tid  8521 (365.194  us) 
+  pid  1689 tid  1689 (311.929  us)  and   pid  8784 tid  8784 (338.670  us) 
+  pid  1689 tid  1689 (311.929  us)  and   pid  8519 tid  8519 (346.456  us) 
 ======================================================================
 
 说明：
