@@ -4,12 +4,12 @@ probe.py是对linux内核进入中断关闭状态进行监测的探针程序。
 参考了BCC仓库下提供的criticalstat.py工具。
 
 主要功能有：
-1、对中断关闭状态进行监测，并记录超过一定阈值的中断关闭状态。
+1、对中断关闭状态进行监测，并记录持续时间超过一定阈值的中断关闭状态。
 2、记录中断关闭时长、调用栈、pid、tid、持有锁、文件、socket等信息。
 3、根据各个中断关闭状态对资源的争抢情况，建立图模型。
-     将中断关闭状态视为点，有对同一资源的争抢则连边，构建中断关闭状态进程关系图。
-     点的权重为中断关闭状态时长，基于并查集维护图模型的联通分量。
-     在获取新的中断关闭状态后，更新整个图模型，并输出最大中断关闭时长进程组(最大联通分量)的信息。
+   将中断关闭状态视为点，有对同一资源的争抢则连边，构建中断关闭状态进程关系图。
+   点的权重为中断关闭状态时长，基于并查集维护图模型的连通分量。
+   在获取新的中断关闭状态后，更新整个图模型，并输出最大中断关闭时长进程组(最大联通分量)的信息。
 
 在运行前请确保：
 1、根据 https://github.com/iovisor/bcc/blob/master/INSTALL.md 中的说明，以源码方式安装了最新版的BCC以及相关库并成功运行实例程序
@@ -17,8 +17,9 @@ probe.py是对linux内核进入中断关闭状态进行监测的探针程序。
 3、在CONFIG_PREEMPTIRQ_TRACEPOINTS、CONGIF_DEBUG_PREEMPT、CONFIG_PREEMPT_TRACER配置选项及其依赖下构建linux内核
 
 使用方法说明：
-[sudo] [python3] ./probe.py [-i] [-p]  [-d DURATION]
+[sudo] [python3] ./probe.py [-h] [-i] [-p] [-d DURATION]
 选项说明：
+    -h 说明信息
     -i 追踪irqoff状态（默认选项）
     -p 追踪preemptoff状态
     -d DURATION 对中断关闭状态的时长(us)进行筛选，默认值为500
@@ -30,23 +31,28 @@ probe.py是对linux内核进入中断关闭状态进行监测的探针程序。
     sudo python3 ./probe.py -p -d 400
 
 程序按 Ctrl -C 结束。
-注意：由于eBPF中ringbuffer在更新时会屏蔽键盘中断，故过小的阈值可能会导致程序难以停止，以及可能需要多次按 Ctrl -C 停止程序。
+注意：由于eBPF中ringbuffer在更新数据时会屏蔽键盘中断，故过小的阈值可能会导致程序难以停止，以及可能需要多次按 Ctrl -C 停止程序
 
 
-运行结果示例：    
+运行结果示例及说明：    
 sudo python3 ./probe.py -i -d 300
+
 
 初始：
 Finding critical section with IRQ disabled for > 300us
 
+说明：
+CS(critical section)，即内核处于irq disabled或preemption disabled状态。此次探测内核的irq disabled状态
+
+
 探测到第一个经过筛选的中断关闭状态：
 Statistical info:
-  Hash map size: 125
-  Hash map items count: 4533
-  Total eBPF time: 103.217043 ms
+  Hash map size: 53
+  Hash map items count: 404
+  Total eBPF time: 0.839884 ms
 ======================================================================
 New CS info:
-  TASK: b'kworker/0:2' (pid 10602 tid 10602) Total CS Time: 326.443  us
+  TASK: b'kworker/0:1' (pid  4470 tid  4470) Total CS Time: 344.999  us
   Section start: b'_raw_spin_lock_irqsave' -> b'e1000_update_stats'
   Section end:   b'_raw_spin_unlock_irqrestore' -> b'e1000_update_stats'
   STACK TRACE RESULT
@@ -61,26 +67,47 @@ New CS info:
     b'ret_from_fork+0x1f'
   All resources:
   lockaddr:
-    0xffffffffa7fbf34c 0xffff937101d640a4 0xffff937199c31000 0xffff937199c30d00 0xffff937199c30a00 0xffffffffa7fbf330 
+    0xffff980241bd66a4 0xffff9802d9c31000 
   fileino:
   sockaddr:
 ======================================================================
-Longest CS group total time: 326.443  us
+Longest CS group total time: 344.999  us
 All thread in group:
-  pid 10602 tid 10602 CS Time: 326.443  us
+  pid  4470 tid  4470 CS Time: 344.999  us
 Share common resource:
 ======================================================================
 
+说明：
+Statistical info:
+  输出统计信息，包含:
+    哈希表大小(即已经记录的全部进程id)
+    哈希表数据量(即记录的各个进程所使用的资源数量总和)
+    eBPF在两次探测到符合要求的中断关闭状态的时间间隔内的，总计运行时间(包括记录资源和记录中断关闭状态的时长)
+New CS info:
+  输出新获取的CS(critical section，即irq off或preemption off状态)信息，包含：
+    进程名、进程id、进入中断关闭状态的时长
+    调用栈信息
+    资源信息，包含锁、文件、socket，其中锁和socket记录的是结构体地址信息(lockaddr和sockaddr)，文件记录的是inode(fileino)
+graph info:
+  程序会建立图模型，将每个超过时间阈值的中断关闭状态作为点，有资源争抢就连边，建立图模型
+  点的权重为其中断关闭时间，基于并查集维护图的连通分量，并同时维护连通分量内的中断关闭时间总和
+  在每次获取新的中断关闭状态后，会更新图模型，并输出图模型中，中断关闭时间总和最大连通分量
+
+  其中 Longest CS group total time 是最大连通分量(即中断关闭时长总和最大的进程组)的中断关闭时长总和
+  All thread in group 是此连通分量内的全部中断关闭状态以及中断关闭时长
+  Share common resource 是图模型中的边，即有资源争抢情况的中断关闭状态
+  资源争抢的判别标准为，一个进程在中断关闭状态中使用某资源，且另一进程在其他时间也使用了此资源
+  (在第一次更新时，仅有一个点，故还未出现资源争抢情况)
 
 
 运行一段时间后：
 Statistical info:
-  Hash map size: 251
-  Hash map items count: 20756
-  Total eBPF time: 474.276422 ms
+  Hash map size: 164
+  Hash map items count: 9524
+  Total eBPF time: 11.209160 ms
 ======================================================================
 New CS info:
-  TASK: b'python3' (pid 12063 tid 12063) Total CS Time: 3190.491 us
+  TASK: b'gnome-shell' (pid  1951 tid  1951) Total CS Time: 550.979  us
   Section start: b'irqentry_enter_from_user_mode' -> b'irqentry_enter'
   Section end:   b'__do_softirq' -> b'irq_exit_rcu'
   STACK TRACE RESULT
@@ -92,23 +119,33 @@ New CS info:
     b'asm_sysvec_apic_timer_interrupt+0x12'
   All resources:
   lockaddr:
-    0xffffe375c5dc4da8 0xffffe375c5c14be8 0xffffe375c42a7968 0xffffe375c53560e8 0xffff937199c31000 0xffffe375c5c18be8 0xffffe375c42e8168 0xffffe375c5dc94a8 
-    0xffff937199c20c80 0xffffe375c0c38828 0xffffe375c0c6fd28 0xffffffffa7963940 0xffffe375c0c6ea68 0xffff93710c470e40 0xffff937199c30a00 0xffffffffa7807a00 
-    0xffffe375c5dc13e8 0xffffe375c0c6fce8 0xffffe375c0c6dc68 0xffff9371014ff9d8 0xffff93710004d000 0xffffffffa8060294 0xffff9371001c9ca4 0xffff937199c30d00 
+    0xffffffff90607a00 0xffff980247fda360 0xffff980247ffb360 0xffff980247ffb760 0xffff9802d9c31000 0xffff980247ffc760 0xffffffff90763940 0xffff9802d9c20c80 
+    0xffffffff90d3ad50 0xffff980247805c00 0xffff9802d9c30a00 0xffff98024871900c 0xffff98024871b00c 0xffff98024cda78a4 0xffff9802d9c30d00 0xffff9802d9c21f00 
+    0xffff9802478358e0 0xffffe89c012d3ae8 0xffff9802401c90a4 0xffff9802480d2358 0xffff9801a4211118 0xffff98024bb829d0 0xffff9802412ec308 0xffff98024bb824d0 
+    0xffffffff90e30fd8 0xffff98024bb82fd0 0xffff98024bb826d0 0xffff9801a4211c58 0xffff9801a37c8298 0xffff9801a4211ad8 0xffff9801a37c8dd8 0xffff9801a37c8898 
+    0xffff98024bb82ad0 0xffff980242ada2d0 
   fileino:
-    5 4026532067 
+    12600 28270 
   sockaddr:
+    0xffff980248167a80 0xffff980248167400 
 ======================================================================
-Longest CS group total time: 10167.559us
+Longest CS group total time: 10571.356us
 All thread in group:
-  pid 10602 tid 10602 CS Time: 326.443  us
-  pid  4276 tid  4295 CS Time: 6040.111 us
-  pid 11547 tid 11547 CS Time: 305.782  us
-  pid 10602 tid 10602 CS Time: 304.732  us
-  pid 12063 tid 12063 CS Time: 3190.491 us
+  pid  3953 tid  3957 CS Time: 313.822  us
+  pid  5193 tid  5193 CS Time: 8201.530 us
+  pid  3979 tid  3979 CS Time: 307.524  us
+  pid  1951 tid  1951 CS Time: 341.651  us
+  pid  3979 tid  3979 CS Time: 555.506  us
+  pid  3979 tid  4549 CS Time: 300.344  us
+  pid  1951 tid  1951 CS Time: 550.979  us
 Share common resource:
-  pid 10602 tid 10602 (326.443  us)  and   pid 11547 tid 11547 (326.932  us) 
-  pid  4276 tid  4295 (6040.111 us)  and   pid 11547 tid 11547 (326.932  us) 
-  pid 11547 tid 11547 (326.932  us)  and   pid 10602 tid 10602 (305.782  us) 
-  pid 11547 tid 11547 (326.932  us)  and   pid 12063 tid 12063 (304.732  us) 
+  pid  3953 tid  3957 (344.999  us)  and   pid  1951 tid  1951 (555.506  us) 
+  pid  5193 tid  5193 (354.423  us)  and   pid  1951 tid  1951 (555.506  us) 
+  pid  3979 tid  3979 (313.822  us)  and   pid  1951 tid  1951 (555.506  us) 
+  pid  1951 tid  1951 (8201.530 us)  and   pid  1951 tid  1951 (555.506  us) 
+  pid  3979 tid  3979 (307.524  us)  and   pid  1951 tid  1951 (555.506  us) 
+  pid  3979 tid  4549 (341.651  us)  and   pid  1951 tid  1951 (555.506  us) 
 ======================================================================
+
+说明：
+  可以发现，此时，最长中断关闭时间进程组中，已经出现了多个进程，并且也发现并记录了资源的争抢情况

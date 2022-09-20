@@ -5,7 +5,7 @@
 # 2、linux内核版本大于5.8,以支持新版eBPF特性
 # 3、在CONFIG_PREEMPTIRQ_TRACEPOINTS、CONGIF_DEBUG_PREEMPT、CONFIG_PREEMPT_TRACER配置选项及其依赖下构建linux内核
 
-# 使用方法: [sudo] [python3] probe.py [-p] [-i] [-d DURATION]
+# 使用方法: [sudo] [python3] probe.py [-h] [-p] [-i] [-d DURATION]
 
 # 2022 杨盾 c0dend
 
@@ -23,7 +23,7 @@ import psutil
 examples=""
 
 parser = argparse.ArgumentParser(
-    description="probe irq/preempt off state",
+    description="probe irq/preempt off state, related resources and find longest irq/preempt off group",
     formatter_class=argparse.RawDescriptionHelpFormatter,
     epilog=examples)
 
@@ -630,6 +630,7 @@ def RecordCS(ctx, data, size):
 
         # update all resources
         enabled[ct.c_int(0)] = ct.c_int(0)
+        tot_time[ct.c_int(0)] = ct.c_int(0)
         UpdateLock(locks)
         locks.clear()
         UpdateFile(files)
