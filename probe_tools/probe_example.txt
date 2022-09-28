@@ -1,0 +1,164 @@
+probe.py的说明：
+
+probe.py是对linux内核进入中断关闭状态进行监测的探针程序。
+参考了BCC仓库下提供的criticalstat.py工具。
+
+主要功能有：
+1、对中断关闭状态进行监测，并记录持续时间超过一定阈值的中断关闭状态。
+2、记录中断关闭时长、调用栈、pid、tid、持有锁、文件、socket等信息。
+3、根据各个中断关闭状态对资源的争抢情况，建立图模型。
+   将中断关闭状态视为点，有对同一资源的争抢则连边，构建中断关闭状态进程关系图。
+   点的权重为中断关闭状态时长，基于并查集维护图模型的连通分量。
+   在获取新的中断关闭状态后，更新整个图模型，并输出最大中断关闭时长进程组(最大联通分量)的信息。
+
+在运行前请确保：
+1、根据 https://github.com/iovisor/bcc/blob/master/INSTALL.md 中的说明，以源码方式安装了最新版的BCC以及相关库并成功运行实例程序
+2、linux内核版本大于5.8,以支持新版eBPF特性
+3、在CONFIG_PREEMPTIRQ_TRACEPOINTS、CONGIF_DEBUG_PREEMPT、CONFIG_PREEMPT_TRACER配置选项及其依赖下构建linux内核
+
+使用方法说明：
+[sudo] [python3] ./probe.py [-h] [-i] [-p] [-d DURATION]
+选项说明：
+    -h 说明信息
+    -i 追踪irqoff状态（默认选项）
+    -p 追踪preemptoff状态
+    -d DURATION 对中断关闭状态的时长(us)进行筛选，默认值为500
+
+示例：
+    sudo python3 ./probe.py
+    sudo python3 ./probe.py -i
+    sudo python3 ./probe.py -d 200
+    sudo python3 ./probe.py -p -d 400
+
+程序按 Ctrl -C 结束。
+注意：由于eBPF中ringbuffer在更新数据时会屏蔽键盘中断，故过小的阈值可能会导致程序难以停止，以及可能需要多次按 Ctrl -C 停止程序
+
+
+运行结果示例及说明：    
+sudo python3 ./probe.py -i -d 300
+
+
+初始：
+Finding critical section with IRQ disabled for > 300us
+
+说明：
+CS(critical section)，即内核处于irq disabled或preemption disabled状态。此次探测内核的irq disabled状态
+
+
+探测到第一个经过筛选的中断关闭状态：
+Statistical info:
+  Hash map size: 26
+  Hash map items count: 198
+  Total eBPF time: 20.597369 ms
+======================================================================
+New CS info:
+  TASK: b'python3' (pid  8784 tid  8784) Total CS Time: 309.843  us
+  Section start: b'irqentry_enter_from_user_mode' -> b'irqentry_enter'
+  Section end:   b'__do_softirq' -> b'irq_exit_rcu'
+  STACK TRACE RESULT
+    b'trace_hardirqs_on+0xae'
+    b'trace_hardirqs_on+0xae'
+    b'__do_softirq+0xaf'
+    b'irq_exit_rcu+0xbc'
+    b'sysvec_apic_timer_interrupt+0x47'
+    b'asm_sysvec_apic_timer_interrupt+0x12'
+  All resources:
+  lockaddr:
+    0xffffe89c012d05a8 0xffffe89c01819fe8 0xffffe89c0218f5a8 0xffff9802d9c31000 0xffffe89c00047068 0xffffe89c00d084a8 0xffffe89c01510168 0xffffe89c01ed38e8 
+    0xffffffff90d3ad50 0xffff98024004d000 0xffffe89c007392a8 0xffffffff90e60294 0xffffe89c00c6de68 0xffff9802414ff798 0xffff9801947edc00 0xffffffff90607a00 
+    0xffffe89c021872e8 0xffffe89c00732ae8 0xffffe89c010f8b28 0xffff9802d9c20c80 0xffffe89c00730de8 0xffffe89c0181b9e8 0xffff9802d9c30a00 0xffffffff90763940 
+    0xffffe89c0218f5e8 0xffffe89c00c6dee8 
+  fileino:
+    4026532067 3015588 1458040 4 
+  sockaddr:
+======================================================================
+Longest CS group total time: 309.843  us
+All thread in group:
+  pid  8784 tid  8784 CS Time: 309.843  us
+Share common resource:
+======================================================================
+
+说明：
+Statistical info:
+  输出统计信息，包含:
+    哈希表大小(即已经记录的全部进程id)
+    哈希表数据量(即记录的各个进程所使用的资源数量总和)
+    eBPF在两次探测到符合要求的中断关闭状态的时间间隔内的，总计运行时间(包括记录资源和记录中断关闭状态的时长)
+New CS info:
+  输出新获取的CS(critical section，即irq off或preemption off状态)信息，包含：
+    进程名、进程id、进入中断关闭状态的时长
+    调用栈信息
+    资源信息，包含锁、文件、socket，其中锁和socket记录的是结构体地址信息(lockaddr和sockaddr)，文件记录的是inode(fileino)
+graph info:
+  程序会建立图模型，将每个超过时间阈值的中断关闭状态作为点，有资源争抢就连边，建立图模型
+  点的权重为其中断关闭时间，基于并查集维护图的连通分量，并同时维护连通分量内的中断关闭时间总和
+  在每次获取新的中断关闭状态后，会更新图模型，并输出图模型中，中断关闭时间总和最大连通分量
+
+  其中 Longest CS group total time 是最大连通分量(即中断关闭时长总和最大的进程组)的中断关闭时长总和
+  All thread in group 是此连通分量内的全部中断关闭状态以及中断关闭时长
+  Share common resource 是图模型中的边，即有资源争抢情况的中断关闭状态
+  资源争抢的判别标准为，一个进程在中断关闭状态中使用某资源，且另一进程在其他时间也使用了此资源
+  (在第一次更新时，仅有一个点，故还未出现资源争抢情况)
+
+
+运行一段时间后：
+
+Statistical info:
+  Hash map size: 94
+  Hash map items count: 3327
+  Total eBPF time: 34.002808 ms
+======================================================================
+New CS info:
+  TASK: b'code' (pid  8519 tid  8519) Total CS Time: 350.478  us
+  Section start: b'__sched_text_start' -> b'schedule'
+  Section end:   b'finish_task_switch' -> b'__sched_text_start'
+  STACK TRACE RESULT
+    b'trace_hardirqs_on+0xae'
+    b'trace_hardirqs_on+0xae'
+    b'finish_task_switch+0x93'
+    b'__sched_text_start+0x2fb'
+    b'schedule+0x58'
+    b'exit_to_user_mode_prepare+0xed'
+    b'syscall_exit_to_user_mode+0x38'
+    b'do_syscall_64+0x69'
+    b'entry_SYSCALL_64_after_hwframe+0x44'
+  All resources:
+  lockaddr:
+    0xffffffff90607a00 0xffff98024029b4c4 0xffff980240298a04 0xffff98024029a404 0xffff9802d9c31000 0xffffe89c01818228 0xffffe89c042f3868 0xffffe89c00048528 
+    0xffffe89c01ee3428 0xffffe89c06476628 0xffff98024029adc4 0xffffe89c05c163a8 0xffffe89c01edcca8 
+  fileino:
+    76626 76643 
+  sockaddr:
+======================================================================
+Longest CS group total time: 22120.710us
+All thread in group:
+  pid  8784 tid  8784 CS Time: 309.843  us
+  pid  8519 tid  8521 CS Time: 8905.989 us
+  pid  8784 tid  8784 CS Time: 396.303  us
+  pid  8539 tid  8539 CS Time: 9498.158 us
+  pid  8519 tid  8521 CS Time: 323.732  us
+  pid  8784 tid  8784 CS Time: 320.464  us
+  pid  8784 tid  8784 CS Time: 311.929  us
+  pid  1689 tid  1689 CS Time: 331.255  us
+  pid  8784 tid  8784 CS Time: 322.239  us
+  pid  8519 tid  8521 CS Time: 365.194  us
+  pid  8519 tid  8521 CS Time: 338.670  us
+  pid  8784 tid  8784 CS Time: 346.456  us
+  pid  8519 tid  8519 CS Time: 350.478  us
+Share common resource:
+  pid  8784 tid  8784 (309.843  us)  and   pid  1689 tid  1689 (311.929  us) 
+  pid  8519 tid  8521 (8905.989 us)  and   pid  1689 tid  1689 (311.929  us) 
+  pid  8784 tid  8784 (396.303  us)  and   pid  1689 tid  1689 (311.929  us) 
+  pid  8539 tid  8539 (345.770  us)  and   pid  1689 tid  1689 (311.929  us) 
+  pid  8519 tid  8521 (9498.158 us)  and   pid  1689 tid  1689 (311.929  us) 
+  pid  8784 tid  8784 (323.732  us)  and   pid  1689 tid  1689 (311.929  us) 
+  pid  8784 tid  8784 (320.464  us)  and   pid  1689 tid  1689 (311.929  us) 
+  pid  1689 tid  1689 (311.929  us)  and   pid  8784 tid  8784 (331.255  us) 
+  pid  1689 tid  1689 (311.929  us)  and   pid  8519 tid  8521 (322.239  us) 
+  pid  1689 tid  1689 (311.929  us)  and   pid  8519 tid  8521 (365.194  us) 
+  pid  1689 tid  1689 (311.929  us)  and   pid  8784 tid  8784 (338.670  us) 
+  pid  1689 tid  1689 (311.929  us)  and   pid  8519 tid  8519 (346.456  us) 
+======================================================================
+
+说明：
+  可以发现，此时，最长中断关闭时间进程组中，已经出现了多个进程，并且也发现并记录了资源的争抢情况
